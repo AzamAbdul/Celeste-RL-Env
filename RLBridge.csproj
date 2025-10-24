@@ -1,0 +1,27 @@
+<!-- RLBridge/RLBridge.csproj -->
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net452</TargetFramework>
+    <AssemblyName>RLBridge</AssemblyName>
+    <RootNamespace>RLBridge</RootNamespace>
+    <Optimize>true</Optimize>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+  </PropertyGroup>
+
+  <!-- Everest copies DLLs from Mods/RLBridge/ automatically; no extra steps needed -->
+  <ItemGroup>
+    <Reference Include="Celeste">
+      <HintPath>../..//Celeste.exe</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Monocle">
+      <HintPath>../..//Monocle.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="FNA">
+      <HintPath>../..//FNA.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+</Project>
