@@ -3,6 +3,7 @@ using System;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using System.Text.Json;
 using System.Threading;
 
 namespace RLBridge
@@ -15,6 +16,12 @@ namespace RLBridge
         private NetworkStream stream;
         private Thread acceptThread, readThread;
         private volatile bool stop;
+
+        // JSON serialization options to avoid encoding issues
+        private static readonly JsonSerializerOptions jsonOptions = new JsonSerializerOptions
+        {
+            Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping
+        };
 
         public JsonLServer(IPAddress ip, int port, Action<string> onLine)
         {
@@ -73,7 +80,7 @@ namespace RLBridge
             if (stream == null) return false;
             try
             {
-                var json = System.Text.Json.JsonSerializer.Serialize(obj) + "\n";
+                var json = JsonSerializer.Serialize(obj, jsonOptions) + "\n";
                 var data = Encoding.UTF8.GetBytes(json);
                 stream.Write(data, 0, data.Length);
                 stream.Flush();
