@@ -10,11 +10,32 @@ namespace RLBridge
         [SettingName("Pause TimeRate (0 = freeze between steps)")]
         public float PauseTimeRate { get; set; } = 1.0f;
 
-        [SettingName("Progress scale (reward multiplier)")]
-        public float ProgressScale { get; set; } = 0.01f;
+        [SettingName("New room reward")]
+        public float NewRoomReward { get; set; } = 10.0f;
+
+        [SettingName("Revisit room penalty")]
+        public float RevisitRoomPenalty { get; set; } = -1.0f;
+
+        [SettingName("Use cell tracking (grid exploration)")]
+        public bool UseCellTracking { get; set; } = true;
+
+        [SettingName("Cell size (pixels per grid cell)")]
+        public float CellSize { get; set; } = 64.0f;
+
+        [SettingName("New cell reward")]
+        public float NewCellReward { get; set; } = 0.1f;
+
+        [SettingName("Revisit cell penalty")]
+        public float RevisitCellPenalty { get; set; } = -0.05f;
 
         [SettingName("Per-step cost")]
-        public float StepCost { get; set; } = 0.001f;
+        public float StepCost { get; set; } = -0.01f;
+
+        [SettingName("Use distance reward")]
+        public bool UseDistanceReward { get; set; } = false;
+
+        [SettingName("Progress scale (if distance enabled)")]
+        public float ProgressScale { get; set; } = 0.01f;
 
         [SettingName("Frame capture enabled")]
         public bool CaptureFrames { get; set; } = true;
