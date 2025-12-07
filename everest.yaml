@@ -1,6 +1,6 @@
 - Name: RLBridge
   Version: 0.1.0
-  DLL: RLBridge.dll
+  DLL: bin/RLBridge.dll
   Dependencies:
     - Name: Everest
-      Version: 1.5935.0
+      Version: 1.5986.0
