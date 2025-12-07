@@ -32,6 +32,7 @@ namespace RLBridge
         private InputState stagedInput = new InputState();
         private bool pendingReset = false;
         private int resetSlot = 0;
+        private int resetDelayFrames = 0;  // Delay reset to let scene stabilize
         private bool responseSent = true;  // Track if we've sent response for current step
         private float accumulatedReward = 0f;  // Accumulate reward across action repeat frames
 
@@ -46,14 +47,18 @@ namespace RLBridge
         // Cell-based exploration tracking (grid within rooms)
         private HashSet<string> visitedCells = new HashSet<string>();
         private string lastCellKey = "";
+        private int framesInCurrentCell = 0;  // Track how long in same cell
+
+        // Episode termination tracking
+        private int stepsSinceLastNewCell = 0;
+        private int episodeSteps = 0;
+
+        // Death tracking (to apply penalty only once)
+        private bool wasDeadLastFrame = false;
 
         // Interop helpers (bound at runtime via reflection)
         private SpeedrunToolInterop srt;
 
-        // Input state tracking for proper button handling
-        private bool lastJump = false;
-        private bool lastDash = false;
-        private bool lastGrab = false;
 
         // Reflection fields for VirtualButton manipulation
         private FieldInfo buttonBuffered;
@@ -75,7 +80,16 @@ namespace RLBridge
             // Get VirtualButton internal fields via reflection
             Type vbType = typeof(VirtualButton);
             buttonBuffered = vbType.GetField("bufferCounter", BindingFlags.Instance | BindingFlags.NonPublic);
+
+            // Try to find the bool override field - name might vary by Celeste version
             buttonCheck = vbType.GetField("DebugOverridePressed", BindingFlags.Instance | BindingFlags.Public);
+
+            // Validate the type is Nullable<bool>
+            if (buttonCheck != null && buttonCheck.FieldType != typeof(bool?))
+            {
+                Logger.Log(LogLevel.Warn, "RLBridge", $"Found DebugOverridePressed but wrong type: {buttonCheck.FieldType.Name}, expected Nullable<Boolean>");
+                buttonCheck = null;
+            }
 
             if (buttonBuffered == null || buttonCheck == null)
             {
@@ -85,7 +99,7 @@ namespace RLBridge
                 Logger.Log(LogLevel.Error, "RLBridge", "Available VirtualButton fields:");
                 foreach (var field in vbType.GetFields(BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public))
                 {
-                    Logger.Log(LogLevel.Error, "RLBridge", $"  - {field.Name} ({field.FieldType.Name})");
+                    Logger.Log(LogLevel.Error, "RLBridge", $"  - {field.Name} ({field.FieldType.FullName})");
                 }
 
                 Logger.Log(LogLevel.Error, "RLBridge", $"Field lookup results: bufferCounter={buttonBuffered != null}, DebugOverridePressed={buttonCheck != null}");
@@ -109,69 +123,256 @@ namespace RLBridge
 
         private void Level_Update(On.Celeste.Level.orig_Update orig, Level self)
         {
-            // Handle reset if requested
-            if (pendingReset)
+            try
             {
-                pendingReset = false;
-                // Try Speedrun Tool savestate load; otherwise fall back to reloading the current session
-                if (srt.IsAvailable && srt.LoadSlot(resetSlot))
-                    Logger.Log(LogLevel.Error, "RLBridge", $"Loaded savestate slot {resetSlot}");
+                // Apply speed multiplier for faster training
+                Engine.TimeRate = Settings.SpeedMultiplier;
+
+                // Check if game is in a stable state for RL operations
+                bool isStable = IsGameStateStable(self);
+
+                // Handle reset with delay to let scene stabilize
+                if (pendingReset)
+                {
+                    if (resetDelayFrames > 0)
+                    {
+                        resetDelayFrames--;
+                        // Clear input during delay to prevent interference
+                        ClearInput();
+                        // Still run game update during delay
+                        orig(self);
+                        return;
+                    }
+
+                    // Delay complete, execute reset
+                    pendingReset = false;
+
+                    // Clear any pending input state before reset
+                    framesToRun = 0;
+                    stagedInput = new InputState();
+                    ClearInput();
+                    accumulatedReward = 0f;
+
+                    // Try Speedrun Tool savestate load; otherwise restart the chapter
+                    if (srt.IsAvailable && resetSlot >= 0 && srt.LoadSlot(resetSlot))
+                    {
+                        Logger.Log(LogLevel.Info, "RLBridge", $"Loaded savestate slot {resetSlot}");
+                    }
+                    else
+                    {
+                        // Restart from the beginning of the chapter
+                        Logger.Log(LogLevel.Info, "RLBridge", $"Restarting chapter from beginning");
+
+                        // Set respawn point to the chapter start
+                        if (self.Session != null)
+                        {
+                            // Get the first room in the chapter
+                            var area = self.Session.Area;
+                            var mapData = AreaData.Areas[area.ID].Mode[(int)area.Mode];
+
+                            if (mapData != null && mapData.MapData != null)
+                            {
+                                var startRoom = mapData.MapData.StartLevel();
+                                if (startRoom != null)
+                                {
+                                    self.Session.Level = startRoom.Name;
+                                    self.Session.RespawnPoint = startRoom.Spawns[0];
+                                    self.Session.FirstLevel = true;
+                                }
+                            }
+                        }
+
+                        // Reload with the updated session
+                        self.Reload();
+                    }
+
+                    // Reset progress baseline (safely)
+                    var p0 = GetValidPlayer(self);
+                    if (p0 != null)
+                    {
+                        startX = p0.X;
+                        maxXProgress = p0.X;
+                    }
+
+                    // Reset room tracking
+                    visitedRooms.Clear();
+                    lastRoom = self.Session?.Level ?? "";
+
+                    // Reset cell tracking
+                    visitedCells.Clear();
+                    lastCellKey = "";
+                    framesInCurrentCell = 0;
+
+                    // Reset episode tracking
+                    stepsSinceLastNewCell = 0;
+                    episodeSteps = 0;
+                    wasDeadLastFrame = false;
+
+                    // Mark that we need to send observation after reset
+                    responseSent = false;
+                }
+
+                // Only apply input and calculate rewards when game is stable
+                bool isRunningStep = framesToRun > 0 && isStable;
+                if (isRunningStep)
+                {
+                    ApplyInput(stagedInput);
+                    framesToRun--;
+                }
                 else
                 {
-                    Logger.Log(LogLevel.Error, "RLBridge", $"Speedrun Tool unavailable -> session restart");
-                    self.Reload();
+                    ClearInput();
                 }
 
-                // Reset progress baseline
-                var p0 = self.Tracker.GetEntity<Player>();
-                if (p0 != null)
+                // Run the game update (this advances by one frame; TAS can "gate" deterministically)
+                orig(self);
+
+                // Accumulate rewards during action repeat frames (only when stable)
+                if (isRunningStep)
                 {
-                    startX = p0.X;
-                    maxXProgress = p0.X;
+                    try
+                    {
+                        var frameReward = CalculateFrameReward(self);
+                        accumulatedReward += frameReward;
+                    }
+                    catch (Exception e)
+                    {
+                        Logger.Log(LogLevel.Warn, "RLBridge", $"Failed to calculate reward: {e.Message}");
+                    }
                 }
 
-                // Reset room tracking
-                visitedRooms.Clear();
-                lastRoom = self.Session?.Level ?? "";
+                // When we finish a request, send an update back to the client (only when stable!)
+                if (framesToRun == 0 && !responseSent && isStable)
+                {
+                    try
+                    {
+                        var (obs, done, info) = ReadObsDone(self);
+                        server.TrySend(new { obs, reward = accumulatedReward, done, info });
+                        responseSent = true;
+                        accumulatedReward = 0f;  // Reset for next step
 
-                // Reset cell tracking
-                visitedCells.Clear();
-                lastCellKey = "";
-
-                // Mark that we need to send observation after reset
-                responseSent = false;
+                        // Auto-reset on episode termination (with delay to let scene stabilize)
+                        if (done)
+                        {
+                            pendingReset = true;
+                            resetSlot = 0;  // Reset to default savestate
+                            resetDelayFrames = 5;  // Wait 5 frames before resetting
+                        }
+                    }
+                    catch (Exception e)
+                    {
+                        Logger.Log(LogLevel.Error, "RLBridge", $"Failed to send observation: {e.Message}");
+                        responseSent = true;  // Mark as sent to avoid getting stuck
+                    }
+                }
             }
+            catch (Exception e)
+            {
+                Logger.Log(LogLevel.Error, "RLBridge", $"Critical error in Level_Update: {e.Message}");
+                Logger.Log(LogLevel.Error, "RLBridge", $"Stack trace: {e.StackTrace}");
 
-            // Apply staged input during step frames
-            bool isRunningStep = framesToRun > 0;
-            if (isRunningStep)
-            {
-                ApplyInput(stagedInput);
-                framesToRun--;
-            }
-            else
-            {
+                // If Python is waiting for a response, send an error response to unblock it
+                if (!responseSent && framesToRun >= 0)
+                {
+                    try
+                    {
+                        var errorObs = new {
+                            px = 0f, py = 0f, vx = 0f, vy = 0f,
+                            onGround = false, dashes = 0, stamina = 0f,
+                            frame = "", frameWidth = 0, frameHeight = 0
+                        };
+                        var errorInfo = new {
+                            error = true,
+                            errorMessage = e.Message,
+                            dead = true,
+                            reachedExit = false,
+                            stagnated = false,
+                            maxStepsReached = false,
+                            episodeSteps = 0,
+                            stepsSinceLastNewCell = 0,
+                            room = "",
+                            area = "",
+                            roomsVisited = 0,
+                            cellsVisited = 0,
+                            cellX = 0,
+                            cellY = 0
+                        };
+                        server.TrySend(new { obs = errorObs, reward = 0f, done = true, info = errorInfo });
+                        responseSent = true;
+                    }
+                    catch
+                    {
+                        // Failed to send error response, but at least we tried
+                    }
+                }
+
+                // Clear state to prevent infinite errors
+                framesToRun = 0;
+                pendingReset = false;
+                resetDelayFrames = 0;
+                accumulatedReward = 0f;
                 ClearInput();
             }
+        }
 
-            // Run the game update (this advances by one frame; TAS can "gate" deterministically)
-            orig(self);
+        // Check if the game state is stable enough for RL operations
+        private bool IsGameStateStable(Level lvl)
+        {
+            if (lvl == null) return false;
+            if (lvl.Transitioning) return false;  // Room transition in progress
+            if (lvl.Frozen) return false;  // Game is frozen (cutscene, etc.)
+            if (lvl.Paused) return false;  // Game is paused
 
-            // Accumulate rewards during action repeat frames
-            if (isRunningStep)
+            // Check if tracker exists and is valid
+            if (lvl.Tracker == null) return false;
+
+            return true;
+        }
+
+        // Safely get player entity only when valid and fully initialized
+        private Player GetValidPlayer(Level lvl)
+        {
+            if (!IsGameStateStable(lvl)) return null;
+
+            Player pl;
+            try
             {
-                var frameReward = CalculateFrameReward(self);
-                accumulatedReward += frameReward;
+                pl = lvl.Tracker.GetEntity<Player>();
+            }
+            catch
+            {
+                return null;
             }
 
-            // When we finish a request, send an update back to the client (only once!)
-            if (framesToRun == 0 && !responseSent)
+            if (pl == null) return null;
+            if (pl.Scene == null) return null;
+
+            // Check if player is being removed from scene
+            try
             {
-                var (obs, done, info) = ReadObsDone(self);
-                server.TrySend(new { obs, reward = accumulatedReward, done, info });
-                responseSent = true;
-                accumulatedReward = 0f;  // Reset for next step
+                if (pl.Scene.Entities.removing.Contains(pl)) return null;
             }
+            catch
+            {
+                return null;
+            }
+
+            // Check if player's collision data is initialized (prevents ClimbBoundsCheck crashes)
+            try
+            {
+                // Try to access Collider - if it throws or is null, player isn't ready
+                if (pl.Collider == null) return null;
+
+                // Quick check that we can read position without crashing
+                var _ = pl.Position;
+            }
+            catch
+            {
+                // Player collision system not ready
+                return null;
+            }
+
+            return pl;
         }
 
         // ======== Command handler (JSON-RPC-ish) ========
@@ -193,6 +394,7 @@ namespace RLBridge
                     case "reset":
                         resetSlot = root.TryGetProperty("slot", out var s) ? s.GetInt32() : 0;
                         pendingReset = true;
+                        resetDelayFrames = 5;  // Wait 5 frames before resetting
                         // Immediate ack; the next Level.Update will send a full obs packet
                         server.TrySend(new { ok = true });
                         break;
@@ -221,10 +423,15 @@ namespace RLBridge
 
         private float CalculateFrameReward(Level lvl)
         {
-            var pl = lvl.Tracker.GetEntity<Player>();
+            var pl = GetValidPlayer(lvl);
             string currentRoom = lvl.Session?.Level ?? "";
             float reward = 0f;
 
+            // Increment episode step counter
+            episodeSteps++;
+            stepsSinceLastNewCell++;
+
+            // Only calculate rewards if player is valid
             if (pl != null)
             {
                 // Calculate cell coordinates (divide position by cell size)
@@ -251,20 +458,39 @@ namespace RLBridge
                 }
 
                 // Check for new cell exploration
-                if (Settings.UseCellTracking && cellKey != lastCellKey)
+                if (Settings.UseCellTracking)
                 {
-                    if (!visitedCells.Contains(cellKey))
+                    if (cellKey != lastCellKey)
                     {
-                        // New cell discovered!
-                        visitedCells.Add(cellKey);
-                        reward += Settings.NewCellReward;
+                        // Changed cells
+                        if (!visitedCells.Contains(cellKey))
+                        {
+                            // New cell discovered!
+                            visitedCells.Add(cellKey);
+                            reward += Settings.NewCellReward;
+                            stepsSinceLastNewCell = 0;  // Reset stagnation counter
+                        }
+                        else
+                        {
+                            // Revisiting a cell (backtracking within room)
+                            reward += Settings.RevisitCellPenalty;
+                        }
+                        lastCellKey = cellKey;
+                        framesInCurrentCell = 0;  // Reset duration counter
                     }
                     else
                     {
-                        // Revisiting a cell (backtracking within room)
-                        reward += Settings.RevisitCellPenalty;
+                        // Still in same cell - increment duration
+                        framesInCurrentCell++;
+
+                        // Apply penalty if staying too long in same cell (inversely scaled by speed)
+                        int scaledIdleThreshold = Math.Max(1, Settings.IdleThreshold / Settings.SpeedMultiplier);
+                        if (Settings.PenalizeIdling && framesInCurrentCell > scaledIdleThreshold)
+                        {
+                            // Flat penalty per frame (linear, not quadratic)
+                            reward += Settings.IdlePenaltyRate;
+                        }
                     }
-                    lastCellKey = cellKey;
                 }
 
                 // Small time penalty to encourage efficiency
@@ -286,6 +512,14 @@ namespace RLBridge
                 reward = Settings.StepCost;
             }
 
+            // Apply death penalty ONLY ONCE when transitioning to dead state
+            bool dead = pl == null || (pl != null && pl.Dead);
+            if (dead && !wasDeadLastFrame && Settings.DeathPenalty != 0)
+            {
+                reward += Settings.DeathPenalty;  // Only applied once!
+            }
+            wasDeadLastFrame = dead;
+
             return reward;
         }
 
@@ -293,21 +527,30 @@ namespace RLBridge
 
         private (object obs, bool done, object info) ReadObsDone(Level lvl)
         {
-            var pl = lvl.Tracker.GetEntity<Player>();
+            var pl = GetValidPlayer(lvl);
             float px = 0, py = 0, vx = 0, vy = 0;
             bool onGround = false;
             int dashes = 0;
             float stamina = 0;
 
+            // Safely read player state
             if (pl != null)
             {
-                px = pl.X;
-                py = pl.Y;
-                vx = pl.Speed.X;
-                vy = pl.Speed.Y;
-                onGround = pl.OnGround();
-                dashes = pl.Dashes;
-                stamina = pl.Stamina;
+                try
+                {
+                    px = pl.X;
+                    py = pl.Y;
+                    vx = pl.Speed.X;
+                    vy = pl.Speed.Y;
+                    onGround = pl.OnGround();
+                    dashes = pl.Dashes;
+                    stamina = pl.Stamina;
+                }
+                catch (Exception e)
+                {
+                    // Player state is invalid (probably during transition/removal)
+                    Logger.Log(LogLevel.Warn, "RLBridge", $"Failed to read player state: {e.Message}");
+                }
             }
 
             // Capture current frame (if enabled in settings)
@@ -344,7 +587,17 @@ namespace RLBridge
             bool dead = pl == null || (pl != null && pl.Dead);
             bool reachedExit = false; // TODO: set true if touching a custom flag or level transition
 
-            bool done = dead || reachedExit;
+            // Additional termination conditions (inversely scaled by speed for faster iteration)
+            // At higher speeds, use LOWER thresholds for faster episode turnover
+            int scaledStagnationThreshold = Math.Max(1, Settings.StagnationThreshold / Settings.SpeedMultiplier);
+            int scaledMaxSteps = Math.Max(1, Settings.MaxEpisodeSteps / Settings.SpeedMultiplier);
+
+            bool stagnated = Settings.TerminateOnStagnation &&
+                            stepsSinceLastNewCell >= scaledStagnationThreshold;
+            bool maxStepsReached = Settings.TerminateOnMaxSteps &&
+                                   episodeSteps >= scaledMaxSteps;
+
+            bool done = dead || reachedExit || stagnated || maxStepsReached;
 
             var obs = new {
                 px, py, vx, vy, onGround, dashes, stamina,
@@ -356,6 +609,10 @@ namespace RLBridge
             var info = new {
                 dead,
                 reachedExit,
+                stagnated,
+                maxStepsReached,
+                episodeSteps,
+                stepsSinceLastNewCell,
                 room = currentRoom,
                 area = lvl.Session?.Area.GetSID() ?? "unknown",
                 roomsVisited = visitedRooms.Count,
@@ -506,58 +763,87 @@ namespace RLBridge
 
         private InputState DecodeAction(int id)
         {
-            // 0: idle
-            // 1: left, 2: right, 3: grab (stationary), 4: jump,
-            // 5..12: dash in 8 dirs (clockwise from up)
-            // 13: grab+left (wall climb left)
-            // 14: grab+right (wall climb right)
-            // 15: grab+jump (climb up while grabbing)
-            // 16: jump+left (running jump left)
-            // 17: jump+right (running jump right)
-            // 18: down (crouch/look down)
-            // 19: down+left (crouch walk left)
-            // 20: down+right (crouch walk right)
-            // 21: grab+jump+left (wall kick left - jump away from right wall)
-            // 22: grab+jump+right (wall kick right - jump away from left wall)
+            // Systematic action space:
+            // 0: Idle
+            // 1-9: Jump + 9 directions
+            // 10-18: Grab + 9 directions
+            // 19-27: Dash + 9 directions
+            // 28-36: Movement only (9 directions, no action)
+            // 37-45: Grab+Jump + 9 directions (CLIMBING!)
+
             var a = new InputState();
 
-            switch (id)
+            if (id == 0)
             {
-                case 0: break;
-                case 1: a.MoveX = -1; break;
-                case 2: a.MoveX = 1; break;
-                case 3: a.Grab = true; break;
-                case 4: a.JumpTap = true; break;
-
-                case 5:  a.Dash = true; a.Aim = new Vector2( 0, -1); break; // up
-                case 6:  a.Dash = true; a.Aim = new Vector2( 1, -1); break;
-                case 7:  a.Dash = true; a.Aim = new Vector2( 1,  0); break;
-                case 8:  a.Dash = true; a.Aim = new Vector2( 1,  1); break;
-                case 9:  a.Dash = true; a.Aim = new Vector2( 0,  1); break;
-                case 10: a.Dash = true; a.Aim = new Vector2(-1,  1); break;
-                case 11: a.Dash = true; a.Aim = new Vector2(-1,  0); break;
-                case 12: a.Dash = true; a.Aim = new Vector2(-1, -1); break;
-
-                // Climbing actions
-                case 13: a.Grab = true; a.MoveX = -1; break;  // grab+left (climb left wall)
-                case 14: a.Grab = true; a.MoveX = 1; break;   // grab+right (climb right wall)
-                case 15: a.Grab = true; a.JumpTap = true; break; // grab+jump (climb up)
-
-                // Running jumps
-                case 16: a.JumpTap = true; a.MoveX = -1; break;  // jump+left (running jump left)
-                case 17: a.JumpTap = true; a.MoveX = 1; break;   // jump+right (running jump right)
-
-                // Crouch/down actions
-                case 18: a.MoveY = 1; break;  // down (crouch/look down)
-                case 19: a.MoveY = 1; a.MoveX = -1; break;  // down+left (crouch walk left)
-                case 20: a.MoveY = 1; a.MoveX = 1; break;   // down+right (crouch walk right)
-
-                // Wall kick (climb jump away from wall)
-                case 21: a.Grab = true; a.JumpTap = true; a.MoveX = -1; break; // wall kick left
-                case 22: a.Grab = true; a.JumpTap = true; a.MoveX = 1; break;  // wall kick right
-
-                default: break;
+                // Idle - do nothing
+                return a;
             }
+
+            // Decode which action group (jump, grab, dash, movement, grab+jump)
+            int actionGroup = (id - 1) / 9;  // 0=jump, 1=grab, 2=dash, 3=movement, 4=grab+jump
+            int dirIndex = (id - 1) % 9;     // 0-8 for direction
+
+            // Set the action
+            switch (actionGroup)
+            {
+                case 0: a.JumpTap = true; break;  // Jump actions (1-9)
+                case 1: a.Grab = true; break;     // Grab actions (10-18)
+                case 2: a.Dash = true; break;     // Dash actions (19-27)
+                case 3: break;                     // Movement only (28-36)
+                case 4: a.Grab = true; a.JumpTap = true; break;  // Grab+Jump (37-45) - CLIMBING!
+            }
+
+            // Set the direction based on dirIndex
+            // 0: neutral, 1: left, 2: right, 3: up, 4: down,
+            // 5: up-left, 6: up-right, 7: down-left, 8: down-right
+            switch (dirIndex)
+            {
+                case 0: // Neutral (no direction)
+                    break;
+                case 1: // Left
+                    a.MoveX = -1;
+                    break;
+                case 2: // Right
+                    a.MoveX = 1;
+                    break;
+                case 3: // Up
+                    a.MoveY = -1;
+                    break;
+                case 4: // Down
+                    a.MoveY = 1;
+                    break;
+                case 5: // Up-left
+                    a.MoveX = -1;
+                    a.MoveY = -1;
+                    break;
+                case 6: // Up-right
+                    a.MoveX = 1;
+                    a.MoveY = -1;
+                    break;
+                case 7: // Down-left
+                    a.MoveX = -1;
+                    a.MoveY = 1;
+                    break;
+                case 8: // Down-right
+                    a.MoveX = 1;
+                    a.MoveY = 1;
+                    break;
+            }
+
+            // For dash, set aim direction based on movement direction
+            if (a.Dash)
+            {
+                if (a.MoveX != 0 || a.MoveY != 0)
+                {
+                    a.Aim = new Vector2(a.MoveX, a.MoveY).SafeNormalize();
+                }
+                else
+                {
+                    // Neutral dash - default to up (or could be forward based on player facing)
+                    a.Aim = new Vector2(0, -1);
+                }
+            }
+
             return a;
         }
 
@@ -568,11 +854,13 @@ namespace RLBridge
             Input.MoveY.Value = a.MoveY; // -1, 0, or 1 (for down/crouch)
 
             // Handle Jump with proper button press injection (tap action)
-            if (a.JumpTap && !lastJump)
+            // IMPORTANT: For climbing, we need jump to trigger even when grab is held
+            if (a.JumpTap)
             {
+                // Always force jump when requested, don't track state
+                // This ensures climb jumps and wall kicks work properly
                 ForceButtonPress(Input.Jump);
             }
-            lastJump = a.JumpTap;
 
             // Handle Grab - MUST be held for wall climbing, not just pressed
             if (a.Grab)
@@ -580,15 +868,14 @@ namespace RLBridge
                 // Hold grab button down (needed for wall climbing)
                 ForceButtonHold(Input.Grab);
             }
-            else if (lastGrab && !a.Grab)
+            else
             {
-                // Release grab button
+                // Release grab button when not in action
                 ForceButtonRelease(Input.Grab);
             }
-            lastGrab = a.Grab;
 
             // Handle Dash with aim direction (tap action)
-            if (a.Dash && !lastDash)
+            if (a.Dash)
             {
                 if (a.Aim != Vector2.Zero)
                 {
@@ -596,7 +883,6 @@ namespace RLBridge
                 }
                 ForceButtonPress(Input.Dash);
             }
-            lastDash = a.Dash;
         }
 
         // Force a button press (for tap actions like jump/dash)
@@ -661,11 +947,6 @@ namespace RLBridge
             Input.MoveX.Value = 0;
             Input.MoveY.Value = 0;
             Input.Aim.Value = Vector2.Zero;
-
-            // Reset button state tracking
-            lastJump = false;
-            lastDash = false;
-            lastGrab = false;
 
             // Clear button buffers to prevent sticking
             Input.Jump.ConsumeBuffer();

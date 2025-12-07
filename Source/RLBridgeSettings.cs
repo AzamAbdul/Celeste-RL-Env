@@ -7,6 +7,10 @@ namespace RLBridge
         [SettingName("TCP Port (restart to apply)")]
         public int TcpPort { get; set; } = 17653;
 
+        [SettingName("Speed multiplier (1=normal, 10=10x speed)")]
+        [SettingRange(1, 100)]
+        public int SpeedMultiplier { get; set; } = 10;
+
         [SettingName("Pause TimeRate (0 = freeze between steps)")]
         public float PauseTimeRate { get; set; } = 1.0f;
 
@@ -28,8 +32,20 @@ namespace RLBridge
         [SettingName("Revisit cell penalty")]
         public float RevisitCellPenalty { get; set; } = -0.05f;
 
+        [SettingName("Penalize idling in same cell")]
+        public bool PenalizeIdling { get; set; } = true;
+
+        [SettingName("Idle threshold (frames in same cell)")]
+        public int IdleThreshold { get; set; } = 10;
+
+        [SettingName("Idle penalty rate (per frame over threshold)")]
+        public float IdlePenaltyRate { get; set; } = -0.01f;
+
         [SettingName("Per-step cost")]
         public float StepCost { get; set; } = -0.01f;
+
+        [SettingName("Death penalty")]
+        public float DeathPenalty { get; set; } = -10.0f;
 
         [SettingName("Use distance reward")]
         public bool UseDistanceReward { get; set; } = false;
@@ -48,6 +64,18 @@ namespace RLBridge
 
         [SettingName("Frame color mode")]
         public FrameColorMode ColorMode { get; set; } = FrameColorMode.LuminanceHue;
+
+        [SettingName("Terminate on stagnation")]
+        public bool TerminateOnStagnation { get; set; } = true;
+
+        [SettingName("Stagnation threshold (steps without new cell)")]
+        public int StagnationThreshold { get; set; } = 500;
+
+        [SettingName("Terminate on max steps")]
+        public bool TerminateOnMaxSteps { get; set; } = true;
+
+        [SettingName("Max episode steps")]
+        public int MaxEpisodeSteps { get; set; } = 5000;
     }
 
     public enum FrameColorMode
