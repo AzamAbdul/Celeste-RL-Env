@@ -36,6 +36,20 @@ namespace RLBridge
         private bool responseSent = true;  // Track if we've sent response for current step
         private float accumulatedReward = 0f;  // Accumulate reward across action repeat frames
 
+        // Performance timing (debug)
+        private System.Diagnostics.Stopwatch perfTimer = new System.Diagnostics.Stopwatch();
+        private double timeFrameCapture = 0.0;
+        private double timeRewardCalc = 0.0;
+        private double timeObsRead = 0.0;
+        private double timeGameUpdate = 0.0;
+        private double timeSendResponse = 0.0;
+        private int perfSteps = 0;
+
+        // Frame rate tracking
+        private int levelUpdateCallCount = 0;
+        private double levelUpdateStartTime = 0.0;
+        private bool vsyncDisabled = false;
+
         // Progress tracking for rewards (you can customize)
         private float maxXProgress = 0f;  // Maximum X position reached (rightward progress)
         private float startX = 0f;        // Starting X position for the episode
@@ -125,7 +139,31 @@ namespace RLBridge
         {
             try
             {
-                // Apply speed multiplier for faster training
+                // Disable VSync once when we know graphics device is ready
+                if (!vsyncDisabled)
+                {
+                    try
+                    {
+                        Engine.Instance.IsFixedTimeStep = false;
+                        Engine.Instance.GraphicsDevice.PresentationParameters.PresentationInterval = PresentInterval.Immediate;
+                        Logger.Log(LogLevel.Info, "RLBridge", "Disabled VSync for unlimited frame rate");
+                        vsyncDisabled = true;
+                    }
+                    catch (Exception e)
+                    {
+                        Logger.Log(LogLevel.Warn, "RLBridge", $"Failed to disable VSync: {e.Message}");
+                        vsyncDisabled = true; // Don't keep trying
+                    }
+                }
+
+                // Track Level_Update call rate
+                levelUpdateCallCount++;
+                if (levelUpdateStartTime == 0.0)
+                {
+                    levelUpdateStartTime = Engine.Scene?.TimeActive ?? 0.0;
+                }
+
+                // Apply speed multiplier - set every frame to override any other mods
                 Engine.TimeRate = Settings.SpeedMultiplier;
 
                 // Check if game is in a stable state for RL operations
@@ -134,6 +172,16 @@ namespace RLBridge
                 // Handle reset with delay to let scene stabilize
                 if (pendingReset)
                 {
+                    // Don't reset during transitions - wait for them to complete
+                    if (!isStable)
+                    {
+                        // Clear input during unstable state
+                        ClearInput();
+                        // Run game update to let transition complete
+                        orig(self);
+                        return;
+                    }
+
                     if (resetDelayFrames > 0)
                     {
                         resetDelayFrames--;
@@ -144,7 +192,7 @@ namespace RLBridge
                         return;
                     }
 
-                    // Delay complete, execute reset
+                    // Delay complete and game is stable, execute reset
                     pendingReset = false;
 
                     // Clear any pending input state before reset
@@ -225,14 +273,18 @@ namespace RLBridge
                 }
 
                 // Run the game update (this advances by one frame; TAS can "gate" deterministically)
+                perfTimer.Restart();
                 orig(self);
+                timeGameUpdate += perfTimer.Elapsed.TotalMilliseconds;
 
                 // Accumulate rewards during action repeat frames (only when stable)
                 if (isRunningStep)
                 {
                     try
                     {
+                        perfTimer.Restart();
                         var frameReward = CalculateFrameReward(self);
+                        timeRewardCalc += perfTimer.Elapsed.TotalMilliseconds;
                         accumulatedReward += frameReward;
                     }
                     catch (Exception e)
@@ -246,22 +298,51 @@ namespace RLBridge
                 {
                     try
                     {
+                        perfTimer.Restart();
                         var (obs, done, info) = ReadObsDone(self);
+                        timeObsRead += perfTimer.Elapsed.TotalMilliseconds;
+
+                        perfTimer.Restart();
                         server.TrySend(new { obs, reward = accumulatedReward, done, info });
+                        timeSendResponse += perfTimer.Elapsed.TotalMilliseconds;
+
                         responseSent = true;
                         accumulatedReward = 0f;  // Reset for next step
+
+                        perfSteps++;
+
+                        // Log performance every 1000 steps
+                        if (perfSteps % 1000 == 0)
+                        {
+                            double totalCSharp = timeGameUpdate + timeRewardCalc + timeObsRead + timeSendResponse;
+                            double elapsedTime = (Engine.Scene?.TimeActive ?? 0.0) - levelUpdateStartTime;
+                            double updateFPS = elapsedTime > 0 ? levelUpdateCallCount / elapsedTime : 0;
+
+                            Logger.Log(LogLevel.Info, "RLBridge",
+                                $"C# Timing (avg per step): GameUpdate={timeGameUpdate/perfSteps:F2}ms, " +
+                                $"RewardCalc={timeRewardCalc/perfSteps:F2}ms, " +
+                                $"ObsRead={timeObsRead/perfSteps:F2}ms, " +
+                                $"SendResponse={timeSendResponse/perfSteps:F2}ms, " +
+                                $"FrameCapture={timeFrameCapture/perfSteps:F2}ms, " +
+                                $"TOTAL={totalCSharp/perfSteps:F2}ms");
+
+                            Logger.Log(LogLevel.Info, "RLBridge",
+                                $"Level_Update call rate: {updateFPS:F1} FPS (target: {Settings.SpeedMultiplier * 60} FPS), " +
+                                $"Total calls: {levelUpdateCallCount}, Elapsed: {elapsedTime:F2}s");
+                        }
 
                         // Auto-reset on episode termination (with delay to let scene stabilize)
                         if (done)
                         {
                             pendingReset = true;
                             resetSlot = 0;  // Reset to default savestate
-                            resetDelayFrames = 5;  // Wait 5 frames before resetting
+                            resetDelayFrames = 25;  // Wait 10 frames before resetting (longer delay for stability)
                         }
                     }
                     catch (Exception e)
                     {
                         Logger.Log(LogLevel.Error, "RLBridge", $"Failed to send observation: {e.Message}");
+                        Logger.Log(LogLevel.Error, "RLBridge", $"Stack trace: {e.StackTrace}");
                         responseSent = true;  // Mark as sent to avoid getting stuck
                     }
                 }
@@ -561,7 +642,9 @@ namespace RLBridge
             {
                 try
                 {
+                    perfTimer.Restart();
                     var frameData = CaptureFrame(out frameWidth, out frameHeight);
+                    timeFrameCapture += perfTimer.Elapsed.TotalMilliseconds;
                     if (frameData != null)
                     {
                         frameBase64 = Convert.ToBase64String(frameData);
@@ -587,10 +670,10 @@ namespace RLBridge
             bool dead = pl == null || (pl != null && pl.Dead);
             bool reachedExit = false; // TODO: set true if touching a custom flag or level transition
 
-            // Additional termination conditions (inversely scaled by speed for faster iteration)
-            // At higher speeds, use LOWER thresholds for faster episode turnover
-            int scaledStagnationThreshold = Math.Max(1, Settings.StagnationThreshold / Settings.SpeedMultiplier);
-            int scaledMaxSteps = Math.Max(1, Settings.MaxEpisodeSteps / Settings.SpeedMultiplier);
+            // Additional termination conditions
+            // Don't scale by speed - agent needs same number of steps regardless of simulation speed
+            int scaledStagnationThreshold = Settings.StagnationThreshold;
+            int scaledMaxSteps = Settings.MaxEpisodeSteps;
 
             bool stagnated = Settings.TerminateOnStagnation &&
                             stepsSinceLastNewCell >= scaledStagnationThreshold;
@@ -627,9 +710,24 @@ namespace RLBridge
         // Capture the current game frame with optional downsampling and color conversion
         private byte[] CaptureFrame(out int width, out int height)
         {
-            var gd = Engine.Instance.GraphicsDevice;
-            int srcWidth = gd.PresentationParameters.BackBufferWidth;
-            int srcHeight = gd.PresentationParameters.BackBufferHeight;
+            width = 0;
+            height = 0;
+
+            try
+            {
+                var gd = Engine.Instance?.GraphicsDevice;
+                if (gd == null || gd.IsDisposed)
+                {
+                    return null;
+                }
+
+                int srcWidth = gd.PresentationParameters.BackBufferWidth;
+                int srcHeight = gd.PresentationParameters.BackBufferHeight;
+
+                if (srcWidth <= 0 || srcHeight <= 0)
+                {
+                    return null;
+                }
 
             // Determine target resolution
             width = Settings.FrameWidth > 0 ? Settings.FrameWidth : srcWidth;
@@ -757,91 +855,107 @@ namespace RLBridge
             }
 
             return result;
+            }
+            catch (Exception e)
+            {
+                Logger.Log(LogLevel.Warn, "RLBridge", $"Failed to capture frame: {e.Message}");
+                return null;
+            }
         }
 
         // ======== Input mapping ========
 
         private InputState DecodeAction(int id)
         {
-            // Systematic action space:
+            // Reduced action space (13 actions):
             // 0: Idle
-            // 1-9: Jump + 9 directions
-            // 10-18: Grab + 9 directions
-            // 19-27: Dash + 9 directions
-            // 28-36: Movement only (9 directions, no action)
-            // 37-45: Grab+Jump + 9 directions (CLIMBING!)
+            // 1: Left
+            // 2: Right
+            // 3: Jump
+            // 4: Jump + Left
+            // 5: Jump + Right
+            // 6: Grab (hold wall)
+            // 7: Climb Jump Left (Grab+Jump+Left)
+            // 8: Climb Jump Right (Grab+Jump+Right)
+            // 9: Dash Left
+            // 10: Dash Right
+            // 11: Dash Up
+            // 12: Dash Up-Left
+            // 13: Dash Up-Right
 
             var a = new InputState();
 
-            if (id == 0)
+            switch (id)
             {
-                // Idle - do nothing
-                return a;
-            }
-
-            // Decode which action group (jump, grab, dash, movement, grab+jump)
-            int actionGroup = (id - 1) / 9;  // 0=jump, 1=grab, 2=dash, 3=movement, 4=grab+jump
-            int dirIndex = (id - 1) % 9;     // 0-8 for direction
-
-            // Set the action
-            switch (actionGroup)
-            {
-                case 0: a.JumpTap = true; break;  // Jump actions (1-9)
-                case 1: a.Grab = true; break;     // Grab actions (10-18)
-                case 2: a.Dash = true; break;     // Dash actions (19-27)
-                case 3: break;                     // Movement only (28-36)
-                case 4: a.Grab = true; a.JumpTap = true; break;  // Grab+Jump (37-45) - CLIMBING!
-            }
-
-            // Set the direction based on dirIndex
-            // 0: neutral, 1: left, 2: right, 3: up, 4: down,
-            // 5: up-left, 6: up-right, 7: down-left, 8: down-right
-            switch (dirIndex)
-            {
-                case 0: // Neutral (no direction)
+                case 0: // Idle
                     break;
+
                 case 1: // Left
                     a.MoveX = -1;
                     break;
+
                 case 2: // Right
                     a.MoveX = 1;
                     break;
-                case 3: // Up
-                    a.MoveY = -1;
-                    break;
-                case 4: // Down
-                    a.MoveY = 1;
-                    break;
-                case 5: // Up-left
-                    a.MoveX = -1;
-                    a.MoveY = -1;
-                    break;
-                case 6: // Up-right
-                    a.MoveX = 1;
-                    a.MoveY = -1;
-                    break;
-                case 7: // Down-left
-                    a.MoveX = -1;
-                    a.MoveY = 1;
-                    break;
-                case 8: // Down-right
-                    a.MoveX = 1;
-                    a.MoveY = 1;
-                    break;
-            }
 
-            // For dash, set aim direction based on movement direction
-            if (a.Dash)
-            {
-                if (a.MoveX != 0 || a.MoveY != 0)
-                {
-                    a.Aim = new Vector2(a.MoveX, a.MoveY).SafeNormalize();
-                }
-                else
-                {
-                    // Neutral dash - default to up (or could be forward based on player facing)
+                case 3: // Jump (neutral)
+                    a.JumpTap = true;
+                    break;
+
+                case 4: // Jump + Left
+                    a.JumpTap = true;
+                    a.MoveX = -1;
+                    break;
+
+                case 5: // Jump + Right
+                    a.JumpTap = true;
+                    a.MoveX = 1;
+                    break;
+
+                case 6: // Grab (for walls)
+                    a.Grab = true;
+                    break;
+
+                case 7: // Climb Jump Left
+                    a.Grab = true;
+                    a.JumpTap = true;
+                    a.MoveX = -1;
+                    break;
+
+                case 8: // Climb Jump Right
+                    a.Grab = true;
+                    a.JumpTap = true;
+                    a.MoveX = 1;
+                    break;
+
+                case 9: // Dash Left
+                    a.Dash = true;
+                    a.Aim = new Vector2(-1, 0);
+                    break;
+
+                case 10: // Dash Right
+                    a.Dash = true;
+                    a.Aim = new Vector2(1, 0);
+                    break;
+
+                case 11: // Dash Up
+                    a.Dash = true;
                     a.Aim = new Vector2(0, -1);
-                }
+                    break;
+
+                case 12: // Dash Up-Left
+                    a.Dash = true;
+                    a.Aim = new Vector2(-1, -1).SafeNormalize();
+                    break;
+
+                case 13: // Dash Up-Right
+                    a.Dash = true;
+                    a.Aim = new Vector2(1, -1).SafeNormalize();
+                    break;
+
+                default:
+                    // Invalid action, do nothing
+                    break;
             }
 
             return a;

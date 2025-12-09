@@ -15,7 +15,7 @@ namespace RLBridge
         public float PauseTimeRate { get; set; } = 1.0f;
 
         [SettingName("New room reward")]
-        public float NewRoomReward { get; set; } = 10.0f;
+        public float NewRoomReward { get; set; } = 100.0f;
 
         [SettingName("Revisit room penalty")]
         public float RevisitRoomPenalty { get; set; } = -1.0f;
@@ -27,7 +27,7 @@ namespace RLBridge
         public float CellSize { get; set; } = 64.0f;
 
         [SettingName("New cell reward")]
-        public float NewCellReward { get; set; } = 0.1f;
+        public float NewCellReward { get; set; } = 1.0f;
 
         [SettingName("Revisit cell penalty")]
         public float RevisitCellPenalty { get; set; } = -0.05f;
