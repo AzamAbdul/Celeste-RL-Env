@@ -47,6 +47,9 @@ namespace RLBridge
         [SettingName("Death penalty")]
         public float DeathPenalty { get; set; } = -10.0f;
 
+        [SettingName("Stagnation penalty")]
+        public float StagnationPenalty { get; set; } = -5.0f;
+
         [SettingName("Use distance reward")]
         public bool UseDistanceReward { get; set; } = false;
 

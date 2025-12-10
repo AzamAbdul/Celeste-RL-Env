@@ -81,6 +81,9 @@ namespace RLBridge
             try
             {
                 var json = JsonSerializer.Serialize(obj, jsonOptions) + "\n";
+                // Debug: log first 100 chars of message being sent
+                var preview = json.Length > 100 ? json.Substring(0, 100) + "..." : json.TrimEnd('\n');
+                Celeste.Mod.Logger.Log("RLBridge", $"[TCP SEND] {preview}");
                 var data = Encoding.UTF8.GetBytes(json);
                 stream.Write(data, 0, data.Length);
                 stream.Flush();

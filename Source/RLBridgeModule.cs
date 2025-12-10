@@ -70,6 +70,21 @@ namespace RLBridge
         // Death tracking (to apply penalty only once)
         private bool wasDeadLastFrame = false;
 
+        // Transition error handling (for high-speed race conditions)
+        private int consecutiveTransitionErrors = 0;
+        private const int MAX_TRANSITION_RETRIES = 30;  // ~0.5s at 60fps, less at high speed
+
+        // Unstable state tracking (to prevent Python from hanging during long transitions)
+        private int framesWaitingForStability = 0;
+        private const int MAX_UNSTABLE_FRAMES = 60;  // ~1s at 60fps, force response after this
+
+        // Warmup period at episode start before stagnation detection applies (in agent steps, not frames)
+        // With action_repeat=4, 75 steps = 300 frames
+        private const int STAGNATION_WARMUP_STEPS = 2000;  // First 300 frames (75 steps @ action_repeat=4)
+
+        // Rendering control (for Python-controlled display toggle)
+        private bool renderingEnabled = true;  // Default enabled for normal operation
+
         // Interop helpers (bound at runtime via reflection)
         private SpeedrunToolInterop srt;
 
@@ -87,6 +102,9 @@ namespace RLBridge
         {
             // Hook the level update
             On.Celeste.Level.Update += Level_Update;
+
+            // Hook Engine rendering to control display (note: frame capture still works)
+            On.Monocle.Engine.RenderCore += Engine_RenderCore;
 
             // Bind optional interops
             srt = new SpeedrunToolInterop().Bind();
@@ -132,7 +150,21 @@ namespace RLBridge
         public override void Unload()
         {
             On.Celeste.Level.Update -= Level_Update;
+            On.Monocle.Engine.RenderCore -= Engine_RenderCore;
             try { server?.Dispose(); } catch { }
+        }
+
+        // Hook to control rendering to display window
+        // Frame capture (GetBackBufferData) still works when rendering is disabled
+        private void Engine_RenderCore(On.Monocle.Engine.orig_RenderCore orig, Engine self)
+        {
+            if (renderingEnabled)
+            {
+                // Normal rendering - draw and present to screen
+                orig(self);
+            }
+            // If disabled, skip rendering - saves GPU overhead
+            // Frame capture still works via GetBackBufferData which reads after game logic
         }
 
         private void Level_Update(On.Celeste.Level.orig_Update orig, Level self)
@@ -144,9 +176,19 @@ namespace RLBridge
                 {
                     try
                     {
+                        // Disable fixed timestep (allows variable frame rate)
                         Engine.Instance.IsFixedTimeStep = false;
+
+                        // Set target to run as fast as possible (TimeSpan.Zero = unlimited)
+                        Engine.Instance.TargetElapsedTime = System.TimeSpan.Zero;
+
+                        // Disable VSync
                         Engine.Instance.GraphicsDevice.PresentationParameters.PresentationInterval = PresentInterval.Immediate;
-                        Logger.Log(LogLevel.Info, "RLBridge", "Disabled VSync for unlimited frame rate");
+
+                        // Don't sleep between frames
+                        Engine.Instance.InactiveSleepTime = System.TimeSpan.Zero;
+
+                        Logger.Log(LogLevel.Info, "RLBridge", "Disabled VSync and frame rate limits for unlimited frame rate");
                         vsyncDisabled = true;
                     }
                     catch (Exception e)
@@ -193,6 +235,7 @@ namespace RLBridge
                     }
 
                     // Delay complete and game is stable, execute reset
+                    Logger.Log(LogLevel.Debug, "RLBridge", "Executing reset now");
                     pendingReset = false;
 
                     // Clear any pending input state before reset
@@ -242,12 +285,26 @@ namespace RLBridge
                         maxXProgress = p0.X;
                     }
 
-                    // Reset room tracking
+                    // Reset room tracking and pre-fill with starting room (don't reward starting location)
                     visitedRooms.Clear();
-                    lastRoom = self.Session?.Level ?? "";
+                    string currentRoomName = self.Session?.Level ?? "";
+                    if (!string.IsNullOrEmpty(currentRoomName))
+                    {
+                        visitedRooms.Add(currentRoomName);  // Pre-fill starting room
+                        Logger.Log(LogLevel.Info, "RLBridge", $"Episode starting in room: {currentRoomName} (pre-filled, no reward)");
+                    }
+                    lastRoom = currentRoomName;
 
-                    // Reset cell tracking
+                    // Reset cell tracking and pre-fill with starting cells (don't reward starting location)
                     visitedCells.Clear();
+                    var pl = self.Tracker?.GetEntity<Player>();
+                    if (pl != null)
+                    {
+                        int startCellX = (int)Math.Floor(pl.Position.X / Settings.CellSize);
+                        int startCellY = (int)Math.Floor(pl.Position.Y / Settings.CellSize);
+                        string startCellKey = $"{currentRoomName}:{startCellX},{startCellY}";
+                        visitedCells.Add(startCellKey);  // Pre-fill starting cell
+                    }
                     lastCellKey = "";
                     framesInCurrentCell = 0;
 
@@ -255,27 +312,89 @@ namespace RLBridge
                     stepsSinceLastNewCell = 0;
                     episodeSteps = 0;
                     wasDeadLastFrame = false;
+                    consecutiveTransitionErrors = 0;  // Reset transition error counter
+                    framesWaitingForStability = 0;  // Reset stability wait counter
 
                     // Mark that we need to send observation after reset
                     responseSent = false;
                 }
 
                 // Only apply input and calculate rewards when game is stable
+                // During transitions, pause frame counting and let game stabilize
                 bool isRunningStep = framesToRun > 0 && isStable;
                 if (isRunningStep)
                 {
                     ApplyInput(stagedInput);
                     framesToRun--;
+                    framesWaitingForStability = 0;  // Reset since we're making progress
                 }
                 else
                 {
                     ClearInput();
+
+                    // Track how long we've been waiting for stability
+                    if (framesToRun > 0 && !isStable)
+                    {
+                        framesWaitingForStability++;
+
+                        // If we've been waiting too long, force completion to prevent Python hang
+                        if (framesWaitingForStability >= MAX_UNSTABLE_FRAMES)
+                        {
+                            Logger.Log(LogLevel.Warn, "RLBridge",
+                                $"Forcing step completion after {framesWaitingForStability} unstable frames");
+                            framesToRun = 0;  // Force completion
+                            framesWaitingForStability = 0;
+                        }
+                    }
                 }
 
                 // Run the game update (this advances by one frame; TAS can "gate" deterministically)
+                // Catch transition race conditions that occur at high speeds
                 perfTimer.Restart();
-                orig(self);
+                bool transitionError = false;
+                try
+                {
+                    orig(self);
+                    // Update succeeded - reset error counter
+                    consecutiveTransitionErrors = 0;
+                }
+                catch (NullReferenceException e)
+                {
+                    // Check if this is a transition-related error (common at high speeds)
+                    if (e.StackTrace?.Contains("TransitionRoutine") == true ||
+                        e.StackTrace?.Contains("CollideFirst") == true)
+                    {
+                        consecutiveTransitionErrors++;
+                        if (consecutiveTransitionErrors <= MAX_TRANSITION_RETRIES)
+                        {
+                            // Transition race condition - wait for next frame to retry
+                            Logger.Log(LogLevel.Debug, "RLBridge",
+                                $"Transition race condition (retry {consecutiveTransitionErrors}/{MAX_TRANSITION_RETRIES})");
+                            transitionError = true;
+                        }
+                        else
+                        {
+                            // Too many retries - let outer handler deal with it
+                            Logger.Log(LogLevel.Warn, "RLBridge",
+                                $"Transition failed after {MAX_TRANSITION_RETRIES} retries, aborting");
+                            throw;
+                        }
+                    }
+                    else
+                    {
+                        // Not a transition error - rethrow
+                        throw;
+                    }
+                }
                 timeGameUpdate += perfTimer.Elapsed.TotalMilliseconds;
+
+                // If we hit a transition error, skip the rest of this frame and retry next frame
+                if (transitionError)
+                {
+                    // Don't count this frame, don't calculate rewards, don't send response
+                    // Just return and let the next frame retry
+                    return;
+                }
 
                 // Accumulate rewards during action repeat frames (only when stable)
                 if (isRunningStep)
@@ -293,16 +412,26 @@ namespace RLBridge
                     }
                 }
 
-                // When we finish a request, send an update back to the client (only when stable!)
-                if (framesToRun == 0 && !responseSent && isStable)
+                // When we finish a request, send an update back to the client
+                // Send response even during transitions to prevent Python from hanging
+                if (framesToRun == 0 && !responseSent)
                 {
                     try
                     {
+                        Logger.Log(LogLevel.Debug, "RLBridge", "About to read observation and send response");
                         perfTimer.Restart();
                         var (obs, done, info) = ReadObsDone(self);
                         timeObsRead += perfTimer.Elapsed.TotalMilliseconds;
 
+                        // Apply stagnation penalty if episode ended due to stagnation
+                        dynamic infoObj = info;
+                        if (done && infoObj.stagnated && Settings.StagnationPenalty != 0)
+                        {
+                            accumulatedReward += Settings.StagnationPenalty;
+                        }
+
                         perfTimer.Restart();
+                        Logger.Log(LogLevel.Debug, "RLBridge", $"Sending observation (done={done})");
                         server.TrySend(new { obs, reward = accumulatedReward, done, info });
                         timeSendResponse += perfTimer.Elapsed.TotalMilliseconds;
 
@@ -360,7 +489,8 @@ namespace RLBridge
                         var errorObs = new {
                             px = 0f, py = 0f, vx = 0f, vy = 0f,
                             onGround = false, dashes = 0, stamina = 0f,
-                            frame = "", frameWidth = 0, frameHeight = 0
+                            frame = "", frameWidth = 0, frameHeight = 0,
+                            stagnationProgress = 0f, episodeProgress = 0f
                         };
                         var errorInfo = new {
                             error = true,
@@ -392,6 +522,8 @@ namespace RLBridge
                 pendingReset = false;
                 resetDelayFrames = 0;
                 accumulatedReward = 0f;
+                consecutiveTransitionErrors = 0;
+                framesWaitingForStability = 0;
                 ClearInput();
             }
         }
@@ -489,6 +621,14 @@ namespace RLBridge
                         // Response will be sent after frames advance in Level_Update
                         break;
 
+                    case "set_render":
+                        bool enabled = root.GetProperty("enabled").GetBoolean();
+                        renderingEnabled = enabled;
+                        Logger.Log(LogLevel.Info, "RLBridge",
+                            $"Rendering {(enabled ? "enabled" : "disabled")}");
+                        server.TrySend(new { ok = true });
+                        break;
+
                     default:
                         server.TrySend(new { error = $"unknown op: {op}" });
                         break;
@@ -564,9 +704,9 @@ namespace RLBridge
                         // Still in same cell - increment duration
                         framesInCurrentCell++;
 
-                        // Apply penalty if staying too long in same cell (inversely scaled by speed)
-                        int scaledIdleThreshold = Math.Max(1, Settings.IdleThreshold / Settings.SpeedMultiplier);
-                        if (Settings.PenalizeIdling && framesInCurrentCell > scaledIdleThreshold)
+                        // Apply penalty if staying too long in same cell
+                        // Don't scale by speed - agent needs same number of frames regardless of simulation speed
+                        if (Settings.PenalizeIdling && framesInCurrentCell > Settings.IdleThreshold)
                         {
                             // Flat penalty per frame (linear, not quadratic)
                             reward += Settings.IdlePenaltyRate;
@@ -594,7 +734,8 @@ namespace RLBridge
             }
 
             // Apply death penalty ONLY ONCE when transitioning to dead state
-            bool dead = pl == null || (pl != null && pl.Dead);
+            // Don't treat null player as death - null happens during transitions
+            bool dead = (pl != null && pl.Dead);
             if (dead && !wasDeadLastFrame && Settings.DeathPenalty != 0)
             {
                 reward += Settings.DeathPenalty;  // Only applied once!
@@ -667,7 +808,9 @@ namespace RLBridge
                 cellY = (int)(pl.Y / Settings.CellSize);
             }
 
-            bool dead = pl == null || (pl != null && pl.Dead);
+            // Only consider it death if player exists and Dead flag is true
+            // Don't treat null player as death - null happens during transitions
+            bool dead = (pl != null && pl.Dead);
             bool reachedExit = false; // TODO: set true if touching a custom flag or level transition
 
             // Additional termination conditions
@@ -675,18 +818,28 @@ namespace RLBridge
             int scaledStagnationThreshold = Settings.StagnationThreshold;
             int scaledMaxSteps = Settings.MaxEpisodeSteps;
 
+            // Only check stagnation after warmup period (first 300 frames / 75 steps)
             bool stagnated = Settings.TerminateOnStagnation &&
+                            episodeSteps >= STAGNATION_WARMUP_STEPS &&
                             stepsSinceLastNewCell >= scaledStagnationThreshold;
             bool maxStepsReached = Settings.TerminateOnMaxSteps &&
                                    episodeSteps >= scaledMaxSteps;
 
             bool done = dead || reachedExit || stagnated || maxStepsReached;
 
+            // Calculate temporal progress signals (0-1 normalized)
+            // Stagnation progress only counts after warmup period
+            float stagnationProgress = episodeSteps < STAGNATION_WARMUP_STEPS ? 0.0f :
+                Math.Min(stepsSinceLastNewCell / (float)Settings.StagnationThreshold, 1.0f);
+            float episodeProgress = Math.Min(episodeSteps / (float)Settings.MaxEpisodeSteps, 1.0f);
+
             var obs = new {
                 px, py, vx, vy, onGround, dashes, stamina,
                 frame = frameBase64,
                 frameWidth,
-                frameHeight
+                frameHeight,
+                stagnationProgress,  // 0-1: How close to stagnation termination
+                episodeProgress      // 0-1: How far through episode
             };
 
             var info = new {
