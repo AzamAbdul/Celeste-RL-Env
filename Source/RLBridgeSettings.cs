@@ -27,7 +27,7 @@ namespace RLBridge
         public float CellSize { get; set; } = 64.0f;
 
         [SettingName("New cell reward")]
-        public float NewCellReward { get; set; } = 1.0f;
+        public float NewCellReward { get; set; } = 0.0f;
 
         [SettingName("Revisit cell penalty")]
         public float RevisitCellPenalty { get; set; } = -0.05f;
@@ -72,7 +72,7 @@ namespace RLBridge
         public bool TerminateOnStagnation { get; set; } = true;
 
         [SettingName("Stagnation threshold (steps without new cell)")]
-        public int StagnationThreshold { get; set; } = 500;
+        public int StagnationThreshold { get; set; } = 10;
 
         [SettingName("Terminate on max steps")]
         public bool TerminateOnMaxSteps { get; set; } = true;

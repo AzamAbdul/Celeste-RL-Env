@@ -68,7 +68,7 @@ namespace RLBridge
         private int episodeSteps = 0;
 
         // Death tracking (to apply penalty only once)
-        private bool wasDeadLastFrame = false;
+        private bool hasDied = false;
 
         // Transition error handling (for high-speed race conditions)
         private int consecutiveTransitionErrors = 0;
@@ -80,7 +80,40 @@ namespace RLBridge
 
         // Warmup period at episode start before stagnation detection applies (in agent steps, not frames)
         // With action_repeat=4, 75 steps = 300 frames
-        private const int STAGNATION_WARMUP_STEPS = 2000;  // First 300 frames (75 steps @ action_repeat=4)
+        private const int STAGNATION_WARMUP_STEPS = 100;  // First 300 frames (75 steps @ action_repeat=4)
+
+        // ======== REWARD/PENALTY/THRESHOLD CONFIGURATION ========
+        // Edit these values directly instead of using the settings menu
+
+        // Episode termination thresholds
+        private const int STAGNATION_THRESHOLD = 300;        // Frames without discovering new cell
+        private const int MAX_EPISODE_STEPS = 5000;         // Maximum frames per episode
+        private const bool TERMINATE_ON_STAGNATION = true;  // Enable stagnation termination
+        private const bool TERMINATE_ON_MAX_STEPS = true;   // Enable max steps termination
+
+        // Rewards
+        private const float NEW_ROOM_REWARD = 200.0f;       // Reward for discovering new room
+        private const float NEW_CELL_REWARD = 1.0f;         // Reward for discovering new cell
+
+        // Penalties
+        private const float DEATH_PENALTY = -50.0f;         // One-time penalty on death
+        private const float STAGNATION_PENALTY = 0f;     // One-time penalty on stagnation termination
+        private const float REVISIT_ROOM_PENALTY = -1.0f;   // Penalty for backtracking to visited room
+        private const float REVISIT_CELL_PENALTY = 0f;  // Penalty for revisiting cell
+        private const float STEP_COST = -0.01f;             // Per-step cost to encourage efficiency
+        private const float IDLE_PENALTY_RATE = 0f;     // Per-frame penalty when idle in same cell
+
+        // Exploration settings
+        private const bool USE_CELL_TRACKING = true;        // Enable grid-based cell tracking
+        private const float CELL_SIZE = 64.0f;              // Pixels per grid cell
+        private const bool PENALIZE_IDLING = true;          // Apply penalty for staying in same cell
+        private const int IDLE_THRESHOLD = 10;              // Frames before idle penalty applies
+
+        // Distance-based reward (optional)
+        private const bool USE_DISTANCE_REWARD = true;     // Enable rightward progress reward
+        private const float PROGRESS_SCALE = 0.01f;         // Scale factor for distance reward
+
+        // ======== END CONFIGURATION ========
 
         // Rendering control (for Python-controlled display toggle)
         private bool renderingEnabled = true;  // Default enabled for normal operation
@@ -142,9 +175,24 @@ namespace RLBridge
             }
 
             // Start TCP server (localhost only)
-            server = new JsonLServer(IPAddress.Loopback, DefaultPort, HandleMessage);
+            // Port priority: 1) Environment variable, 2) Settings, 3) DefaultPort
+            int port = DefaultPort;
+
+            string envPort = Environment.GetEnvironmentVariable("RLBRIDGE_PORT");
+            if (!string.IsNullOrEmpty(envPort) && int.TryParse(envPort, out int parsedPort))
+            {
+                port = parsedPort;
+                Logger.Log(LogLevel.Info, "RLBridge", $"Using port from RLBRIDGE_PORT environment variable: {port}");
+            }
+            else if (Settings.TcpPort != DefaultPort)
+            {
+                port = Settings.TcpPort;
+                Logger.Log(LogLevel.Info, "RLBridge", $"Using port from settings: {port}");
+            }
+
+            server = new JsonLServer(IPAddress.Loopback, port, HandleMessage);
             server.Start();
-            Logger.Log(LogLevel.Error, "RLBridge", $"Started JSONL server at 127.0.0.1:{DefaultPort}");
+            Logger.Log(LogLevel.Info, "RLBridge", $"Started JSONL server at 127.0.0.1:{port}");
         }
 
         public override void Unload()
@@ -300,8 +348,8 @@ namespace RLBridge
                     var pl = self.Tracker?.GetEntity<Player>();
                     if (pl != null)
                     {
-                        int startCellX = (int)Math.Floor(pl.Position.X / Settings.CellSize);
-                        int startCellY = (int)Math.Floor(pl.Position.Y / Settings.CellSize);
+                        int startCellX = (int)Math.Floor(pl.Position.X / CELL_SIZE);
+                        int startCellY = (int)Math.Floor(pl.Position.Y / CELL_SIZE);
                         string startCellKey = $"{currentRoomName}:{startCellX},{startCellY}";
                         visitedCells.Add(startCellKey);  // Pre-fill starting cell
                     }
@@ -311,9 +359,14 @@ namespace RLBridge
                     // Reset episode tracking
                     stepsSinceLastNewCell = 0;
                     episodeSteps = 0;
-                    wasDeadLastFrame = false;
+                    hasDied = false;
                     consecutiveTransitionErrors = 0;  // Reset transition error counter
                     framesWaitingForStability = 0;  // Reset stability wait counter
+
+                    Logger.Log(LogLevel.Info, "RLBridge",
+                        $"[RESET] Counters reset: episodeSteps=0, stepsSinceLastNewCell=0");
+                    Logger.Log(LogLevel.Info, "RLBridge",
+                        $"[CONFIG] StagnationThreshold={STAGNATION_THRESHOLD}, MaxEpisodeSteps={MAX_EPISODE_STEPS}, WarmupSteps={STAGNATION_WARMUP_STEPS}");
 
                     // Mark that we need to send observation after reset
                     responseSent = false;
@@ -405,6 +458,13 @@ namespace RLBridge
                         var frameReward = CalculateFrameReward(self);
                         timeRewardCalc += perfTimer.Elapsed.TotalMilliseconds;
                         accumulatedReward += frameReward;
+
+                        // Log every 100th frame to track progress
+                        if (episodeSteps % 100 == 0)
+                        {
+                            Logger.Log(LogLevel.Info, "RLBridge",
+                                $"[FRAME] episodeSteps={episodeSteps}, framesToRun={framesToRun}, stepsSinceLastNewCell={stepsSinceLastNewCell}");
+                        }
                     }
                     catch (Exception e)
                     {
@@ -423,11 +483,21 @@ namespace RLBridge
                         var (obs, done, info) = ReadObsDone(self);
                         timeObsRead += perfTimer.Elapsed.TotalMilliseconds;
 
-                        // Apply stagnation penalty if episode ended due to stagnation
+                        // Apply termination penalties (death penalty applied first, takes precedence)
                         dynamic infoObj = info;
-                        if (done && infoObj.stagnated && Settings.StagnationPenalty != 0)
+                        if (done)
                         {
-                            accumulatedReward += Settings.StagnationPenalty;
+                            // Death penalty (highest priority)
+                            if (infoObj.dead && DEATH_PENALTY != 0)
+                            {
+                                accumulatedReward += DEATH_PENALTY;
+
+                            }
+                            // Stagnation penalty (only if not dead)
+                            else if (infoObj.stagnated && STAGNATION_PENALTY != 0)
+                            {
+                                accumulatedReward += STAGNATION_PENALTY;
+                            }
                         }
 
                         perfTimer.Restart();
@@ -554,16 +624,35 @@ namespace RLBridge
             }
             catch
             {
+                Logger.Log(LogLevel.Info, "RLBridge", "[DEATH DEBUG] GetValidPlayer: Exception getting player from tracker");
                 return null;
             }
 
-            if (pl == null) return null;
-            if (pl.Scene == null) return null;
+            if (pl == null)
+            {
+                Logger.Log(LogLevel.Info, "RLBridge", "[DEATH DEBUG] GetValidPlayer: Player is null");
+                return null;
+            }
 
-            // Check if player is being removed from scene
+            if (pl.Scene == null)
+            {
+                Logger.Log(LogLevel.Info, "RLBridge", $"[DEATH DEBUG] GetValidPlayer: Player.Scene is null, pl.Dead={pl.Dead}");
+                return null;
+            }
+
+            // Check if player is being removed or added to scene
             try
             {
-                if (pl.Scene.Entities.removing.Contains(pl)) return null;
+                bool removing = pl.Scene.Entities.removing.Contains(pl);
+                bool adding = pl.Scene.Entities.adding.Contains(pl);
+                hasDied = hasDied || pl.Dead;
+
+                if (removing || adding)
+                {
+                    Logger.Log(LogLevel.Info, "RLBridge",
+                        $"[DEATH DEBUG] GetValidPlayer: Player being removed/added, pl.Dead={pl.Dead}, removing={removing}, adding={adding}");
+                    return null;
+                }
             }
             catch
             {
@@ -618,6 +707,8 @@ namespace RLBridge
                         stagedInput = DecodeAction(action);
                         framesToRun = Math.Max(1, repeat);
                         responseSent = false;  // Mark that we need to send response
+                        Logger.Log(LogLevel.Info, "RLBridge",
+                            $"[STEP] Received step command: action={action}, repeat={repeat}, framesToRun={framesToRun}");
                         // Response will be sent after frames advance in Level_Update
                         break;
 
@@ -648,16 +739,20 @@ namespace RLBridge
             string currentRoom = lvl.Session?.Level ?? "";
             float reward = 0f;
 
-            // Increment episode step counter
-            episodeSteps++;
-            stepsSinceLastNewCell++;
+            // Track player state for death detection (used in ReadObsDone)
+            // Don't apply death penalty here - it will be applied at episode end
+            hasDied = hasDied || (pl != null && pl.Dead);
 
-            // Only calculate rewards if player is valid
-            if (pl != null)
+            // Only calculate rewards if player is valid AND alive
+            // Skip reward calculation during death animation to prevent stagnation false positives
+            if (!hasDied)
             {
+                // Increment episode step counter (only when alive)
+                episodeSteps++;
+                stepsSinceLastNewCell++;
                 // Calculate cell coordinates (divide position by cell size)
-                int cellX = (int)(pl.X / Settings.CellSize);
-                int cellY = (int)(pl.Y / Settings.CellSize);
+                int cellX = (int)(pl.X / CELL_SIZE);
+                int cellY = (int)(pl.Y / CELL_SIZE);
                 string cellKey = $"{currentRoom}:{cellX},{cellY}";
 
                 // Check for room changes
@@ -667,19 +762,19 @@ namespace RLBridge
                     {
                         // New room discovered!
                         visitedRooms.Add(currentRoom);
-                        reward += Settings.NewRoomReward;
+                        reward += NEW_ROOM_REWARD;
                         Logger.Log(LogLevel.Info, "RLBridge", $"New room discovered: {currentRoom} (total: {visitedRooms.Count})");
                     }
                     else
                     {
                         // Revisiting a room (backtracking)
-                        reward += Settings.RevisitRoomPenalty;
+                        reward += REVISIT_ROOM_PENALTY;
                     }
                     lastRoom = currentRoom;
                 }
 
                 // Check for new cell exploration
-                if (Settings.UseCellTracking)
+                if (USE_CELL_TRACKING)
                 {
                     if (cellKey != lastCellKey)
                     {
@@ -688,13 +783,15 @@ namespace RLBridge
                         {
                             // New cell discovered!
                             visitedCells.Add(cellKey);
-                            reward += Settings.NewCellReward;
+                            reward += NEW_CELL_REWARD;
                             stepsSinceLastNewCell = 0;  // Reset stagnation counter
+                            Logger.Log(LogLevel.Info, "RLBridge",
+                                $"[NEW CELL] stepsSinceLastNewCell reset to 0 at episodeStep {episodeSteps}, cell: {cellKey}");
                         }
                         else
                         {
                             // Revisiting a cell (backtracking within room)
-                            reward += Settings.RevisitCellPenalty;
+                            reward += REVISIT_CELL_PENALTY;
                         }
                         lastCellKey = cellKey;
                         framesInCurrentCell = 0;  // Reset duration counter
@@ -706,41 +803,32 @@ namespace RLBridge
 
                         // Apply penalty if staying too long in same cell
                         // Don't scale by speed - agent needs same number of frames regardless of simulation speed
-                        if (Settings.PenalizeIdling && framesInCurrentCell > Settings.IdleThreshold)
+                        if (PENALIZE_IDLING && framesInCurrentCell > IDLE_THRESHOLD)
                         {
                             // Flat penalty per frame (linear, not quadratic)
-                            reward += Settings.IdlePenaltyRate;
+                            reward += IDLE_PENALTY_RATE;
                         }
                     }
                 }
 
                 // Small time penalty to encourage efficiency
-                reward += Settings.StepCost;
+                reward += STEP_COST;
 
                 // Optional: small distance-based reward for progress within a room
-                if (Settings.UseDistanceReward)
+                if (USE_DISTANCE_REWARD)
                 {
                     float currentX = pl.X;
                     float newProgress = Math.Max(currentX, maxXProgress);
                     float progressDelta = newProgress - maxXProgress;
                     maxXProgress = newProgress;
-                    reward += progressDelta * Settings.ProgressScale;
+                    reward += progressDelta * PROGRESS_SCALE;
                 }
             }
             else
             {
-                // Player doesn't exist (dead)
-                reward = Settings.StepCost;
+                // Player doesn't exist during transitions or is dead
+                reward = STEP_COST;
             }
-
-            // Apply death penalty ONLY ONCE when transitioning to dead state
-            // Don't treat null player as death - null happens during transitions
-            bool dead = (pl != null && pl.Dead);
-            if (dead && !wasDeadLastFrame && Settings.DeathPenalty != 0)
-            {
-                reward += Settings.DeathPenalty;  // Only applied once!
-            }
-            wasDeadLastFrame = dead;
 
             return reward;
         }
@@ -804,34 +892,37 @@ namespace RLBridge
 
             if (pl != null)
             {
-                cellX = (int)(pl.X / Settings.CellSize);
-                cellY = (int)(pl.Y / Settings.CellSize);
+                cellX = (int)(pl.X / CELL_SIZE);
+                cellY = (int)(pl.Y / CELL_SIZE);
             }
 
-            // Only consider it death if player exists and Dead flag is true
-            // Don't treat null player as death - null happens during transitions
-            bool dead = (pl != null && pl.Dead);
+            // ======== EPISODE TERMINATION LOGIC ========
+            // Check termination conditions with priority: Death > Exit > MaxSteps > Stagnation
+
+            // 1. Death check (highest priority)
+            bool dead = hasDied;
+
+            // 2. Exit check
             bool reachedExit = false; // TODO: set true if touching a custom flag or level transition
 
-            // Additional termination conditions
-            // Don't scale by speed - agent needs same number of steps regardless of simulation speed
-            int scaledStagnationThreshold = Settings.StagnationThreshold;
-            int scaledMaxSteps = Settings.MaxEpisodeSteps;
+            // 3. Max steps check
+            bool maxStepsReached = TERMINATE_ON_MAX_STEPS &&
+                                   episodeSteps >= MAX_EPISODE_STEPS;
 
-            // Only check stagnation after warmup period (first 300 frames / 75 steps)
-            bool stagnated = Settings.TerminateOnStagnation &&
+            // 4. Stagnation check (lowest priority - only if not dead)
+            // Don't check stagnation if player is dead (prevents "stagnation during death animation" bug)
+            bool stagnated = !dead &&  // Death takes precedence
+                            TERMINATE_ON_STAGNATION &&
                             episodeSteps >= STAGNATION_WARMUP_STEPS &&
-                            stepsSinceLastNewCell >= scaledStagnationThreshold;
-            bool maxStepsReached = Settings.TerminateOnMaxSteps &&
-                                   episodeSteps >= scaledMaxSteps;
+                            stepsSinceLastNewCell >= STAGNATION_THRESHOLD;
 
-            bool done = dead || reachedExit || stagnated || maxStepsReached;
+            bool done = dead || reachedExit || maxStepsReached || stagnated;
 
             // Calculate temporal progress signals (0-1 normalized)
             // Stagnation progress only counts after warmup period
             float stagnationProgress = episodeSteps < STAGNATION_WARMUP_STEPS ? 0.0f :
-                Math.Min(stepsSinceLastNewCell / (float)Settings.StagnationThreshold, 1.0f);
-            float episodeProgress = Math.Min(episodeSteps / (float)Settings.MaxEpisodeSteps, 1.0f);
+                Math.Min(stepsSinceLastNewCell / (float)STAGNATION_THRESHOLD, 1.0f);
+            float episodeProgress = Math.Min(episodeSteps / (float)MAX_EPISODE_STEPS, 1.0f);
 
             var obs = new {
                 px, py, vx, vy, onGround, dashes, stamina,
