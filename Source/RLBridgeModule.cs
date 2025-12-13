@@ -2,6 +2,7 @@
 using Celeste.Mod;  // << needed for EverestModule, EverestModuleSettings, Logger, etc.
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Net;
 using System.Net.Sockets;
 using System.Reflection;
@@ -11,6 +12,7 @@ using System.Text.Json;
 using Celeste;
 using Microsoft.Xna.Framework;
 using Microsoft.Xna.Framework.Graphics;
+using Microsoft.Xna.Framework.Input;
 using Monocle;
 
 namespace RLBridge
@@ -58,6 +60,10 @@ namespace RLBridge
         private HashSet<string> visitedRooms = new HashSet<string>();
         private string lastRoom = "";
 
+        // Exit tracking (room adjacency from Level.Bounds)
+        private Dictionary<string, List<Vector2>> roomExits = new Dictionary<string, List<Vector2>>();
+        private string lastExitScanRoom = "";
+
         // Cell-based exploration tracking (grid within rooms)
         private HashSet<string> visitedCells = new HashSet<string>();
         private string lastCellKey = "";
@@ -86,22 +92,24 @@ namespace RLBridge
         // Edit these values directly instead of using the settings menu
 
         // Episode termination thresholds
-        private const int STAGNATION_THRESHOLD = 300;        // Frames without discovering new cell
-        private const int MAX_EPISODE_STEPS = 5000;         // Maximum frames per episode
+        private const int STAGNATION_THRESHOLD = 750;        // Frames without discovering new cell
+        private const int MAX_EPISODE_STEPS = 50000;         // Maximum frames per episode
         private const bool TERMINATE_ON_STAGNATION = true;  // Enable stagnation termination
         private const bool TERMINATE_ON_MAX_STEPS = true;   // Enable max steps termination
 
         // Rewards
-        private const float NEW_ROOM_REWARD = 200.0f;       // Reward for discovering new room
-        private const float NEW_CELL_REWARD = 1.0f;         // Reward for discovering new cell
+        private const float NEW_ROOM_REWARD = 100000.0f;       // Reward for discovering new room
+        private const float NEW_CELL_REWARD = 0.0f;         // Reward for discovering new cell
+        private const float EXIT_PROXIMITY_MULTIPLIER = 10.0f; // Multiplier for exit proximity reward
+        private const float EXIT_DISTANCE_SCALE = 0.001f;    // Scale factor for exponential decay (1/1000 pixels)
 
         // Penalties
-        private const float DEATH_PENALTY = -50.0f;         // One-time penalty on death
-        private const float STAGNATION_PENALTY = 0f;     // One-time penalty on stagnation termination
+        private const float DEATH_PENALTY = -500.0f;         // One-time penalty on death
+        private const float STAGNATION_PENALTY = -500f;     // One-time penalty on stagnation termination
         private const float REVISIT_ROOM_PENALTY = -1.0f;   // Penalty for backtracking to visited room
         private const float REVISIT_CELL_PENALTY = 0f;  // Penalty for revisiting cell
-        private const float STEP_COST = -0.01f;             // Per-step cost to encourage efficiency
-        private const float IDLE_PENALTY_RATE = 0f;     // Per-frame penalty when idle in same cell
+        private const float STEP_COST = -0.001f;             // Per-step cost to encourage efficiency
+        private const float IDLE_PENALTY_RATE = -0.01f;     // Per-frame penalty when idle in same cell
 
         // Exploration settings
         private const bool USE_CELL_TRACKING = true;        // Enable grid-based cell tracking
@@ -125,6 +133,21 @@ namespace RLBridge
         // Reflection fields for VirtualButton manipulation
         private FieldInfo buttonBuffered;
         private FieldInfo buttonCheck;
+        private FieldInfo buttonBinding;
+
+        // Fields for Binding manipulation
+        private FieldInfo bindingPressed;
+        private MethodInfo bindingUpdateMethod;
+
+        // MInput keyboard state manipulation
+        private object keyboardDataInstance;
+        private FieldInfo kbCurrentState;
+        private FieldInfo kbPreviousState;
+
+        // Cached keys for each action
+        private Keys grabKey = Keys.Z;
+        private Keys jumpKey = Keys.C;
+        private Keys dashKey = Keys.X;
 
         public RLBridgeModule()
         {
@@ -149,16 +172,103 @@ namespace RLBridge
             // Try to find the bool override field - name might vary by Celeste version
             buttonCheck = vbType.GetField("DebugOverridePressed", BindingFlags.Instance | BindingFlags.Public);
 
-            // Validate the type is Nullable<bool>
-            if (buttonCheck != null && buttonCheck.FieldType != typeof(bool?))
+            // Validate the type - accept both Nullable<bool> and Nullable<Keys>
+            if (buttonCheck != null && buttonCheck.FieldType != typeof(bool?) && buttonCheck.FieldType != typeof(Keys?))
             {
-                Logger.Log(LogLevel.Warn, "RLBridge", $"Found DebugOverridePressed but wrong type: {buttonCheck.FieldType.Name}, expected Nullable<Boolean>");
+                Logger.Log(LogLevel.Warn, "RLBridge",
+                    $"Found DebugOverridePressed but incompatible type: {buttonCheck.FieldType.Name}. Using buffer-only mode for inputs.");
                 buttonCheck = null;
             }
 
-            if (buttonBuffered == null || buttonCheck == null)
+            if (buttonCheck != null)
             {
-                Logger.Log(LogLevel.Error, "RLBridge", "Could not find VirtualButton internal fields");
+                Logger.Log(LogLevel.Info, "RLBridge",
+                    $"Found DebugOverridePressed field with type: {buttonCheck.FieldType.Name}");
+            }
+
+            // Get the Binding field
+            buttonBinding = vbType.GetField("Binding", BindingFlags.Instance | BindingFlags.Public);
+
+            // If we have the Binding field, investigate the Binding type
+            if (buttonBinding != null)
+            {
+                Type bindingType = buttonBinding.FieldType;
+                Logger.Log(LogLevel.Info, "RLBridge", $"Found Binding field, investigating {bindingType.Name} type:");
+
+                // List all Binding fields
+                foreach (var field in bindingType.GetFields(BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public))
+                {
+                    Logger.Log(LogLevel.Info, "RLBridge", $"  Binding field: {field.Name} ({field.FieldType.FullName})");
+                }
+
+                // Try to find a pressed state field in Binding
+                bindingPressed = bindingType.GetField("pressed", BindingFlags.Instance | BindingFlags.NonPublic);
+                if (bindingPressed == null)
+                {
+                    bindingPressed = bindingType.GetField("Pressed", BindingFlags.Instance | BindingFlags.Public);
+                }
+
+                if (bindingPressed != null)
+                {
+                    Logger.Log(LogLevel.Info, "RLBridge", $"Found Binding.pressed field: {bindingPressed.FieldType.FullName}");
+                }
+            }
+
+            // Investigate the Node type
+            var nodesField = vbType.GetField("Nodes", BindingFlags.Instance | BindingFlags.Public);
+            if (nodesField != null)
+            {
+                // Get the Node type from the List<Node>
+                var listType = nodesField.FieldType;
+                if (listType.IsGenericType && listType.GetGenericArguments().Length > 0)
+                {
+                    Type nodeType = listType.GetGenericArguments()[0];
+                    Logger.Log(LogLevel.Info, "RLBridge", $"Found Node type: {nodeType.FullName}");
+                    Logger.Log(LogLevel.Info, "RLBridge", "Node type members:");
+
+                    // List all fields in Node
+                    foreach (var field in nodeType.GetFields(BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public))
+                    {
+                        Logger.Log(LogLevel.Info, "RLBridge", $"  Node field: {field.Name} ({field.FieldType.FullName})");
+                    }
+
+                    // List all methods in Node
+                    foreach (var method in nodeType.GetMethods(BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public))
+                    {
+                        if (method.Name.Contains("Check") || method.Name.Contains("Press") || method.Name.Contains("Update"))
+                        {
+                            Logger.Log(LogLevel.Info, "RLBridge", $"  Node method: {method.Name}");
+                        }
+                    }
+                }
+            }
+
+            // Get MInput.Keyboard instance for direct keyboard state manipulation
+            Type mInputType = typeof(MInput);
+            var kbField = mInputType.GetField("Keyboard", BindingFlags.Static | BindingFlags.Public);
+            if (kbField != null)
+            {
+                keyboardDataInstance = kbField.GetValue(null);
+                Type keyboardDataType = kbField.FieldType;
+
+                kbCurrentState = keyboardDataType.GetField("CurrentState", BindingFlags.Instance | BindingFlags.Public);
+                kbPreviousState = keyboardDataType.GetField("PreviousState", BindingFlags.Instance | BindingFlags.Public);
+
+                if (kbCurrentState != null && kbPreviousState != null)
+                {
+                    Logger.Log(LogLevel.Info, "RLBridge",
+                        "Successfully found keyboard state fields - will use direct keyboard injection");
+                }
+                else
+                {
+                    Logger.Log(LogLevel.Error, "RLBridge",
+                        "Failed to find keyboard state fields - input will not work!");
+                }
+            }
+
+            if (buttonBuffered == null)
+            {
+                Logger.Log(LogLevel.Error, "RLBridge", "CRITICAL: Could not find bufferCounter field - button input will NOT work!");
 
                 // List all fields for debugging
                 Logger.Log(LogLevel.Error, "RLBridge", "Available VirtualButton fields:");
@@ -166,12 +276,16 @@ namespace RLBridge
                 {
                     Logger.Log(LogLevel.Error, "RLBridge", $"  - {field.Name} ({field.FieldType.FullName})");
                 }
-
-                Logger.Log(LogLevel.Error, "RLBridge", $"Field lookup results: bufferCounter={buttonBuffered != null}, DebugOverridePressed={buttonCheck != null}");
+            }
+            else if (buttonCheck == null)
+            {
+                Logger.Log(LogLevel.Info, "RLBridge",
+                    "Using buffer-only mode for button inputs (DebugOverridePressed not available). Grab/climb will use repeated buffering.");
             }
             else
             {
-                Logger.Log(LogLevel.Info, "RLBridge", "Successfully found VirtualButton fields: bufferCounter and DebugOverridePressed");
+                Logger.Log(LogLevel.Info, "RLBridge",
+                    "Successfully found VirtualButton fields: bufferCounter and DebugOverridePressed");
             }
 
             // Start TCP server (localhost only)
@@ -340,6 +454,9 @@ namespace RLBridge
                     {
                         visitedRooms.Add(currentRoomName);  // Pre-fill starting room
                         Logger.Log(LogLevel.Info, "RLBridge", $"Episode starting in room: {currentRoomName} (pre-filled, no reward)");
+
+                        // Scan for exits in starting room
+                        ScanForExits(self, currentRoomName);
                     }
                     lastRoom = currentRoomName;
 
@@ -383,7 +500,12 @@ namespace RLBridge
                 }
                 else
                 {
-                    ClearInput();
+                    // Only clear input when there's an active step waiting
+                    // This allows manual control when framesToRun == 0
+                    if (framesToRun > 0)
+                    {
+                        ClearInput();
+                    }
 
                     // Track how long we've been waiting for stability
                     if (framesToRun > 0 && !isStable)
@@ -733,6 +855,126 @@ namespace RLBridge
 
         // ======== Reward calculation (per frame) ========
 
+        private void ScanForExits(Level lvl, string roomName)
+        {
+            if (string.IsNullOrEmpty(roomName) || roomName == lastExitScanRoom)
+                return;
+
+            lastExitScanRoom = roomName;
+            var exits = new List<Vector2>();
+
+            // Get current room bounds
+            Rectangle currentBounds = lvl.Bounds;
+
+            // Check all rooms in the map for adjacency
+            if (lvl.Session?.MapData?.Levels != null)
+            {
+                Logger.Log(LogLevel.Info, "RLBridge", $"current bounds. Top: {currentBounds.Top} Bottom: {currentBounds.Bottom} Left: {currentBounds.Left} Right: {currentBounds.Right}");
+                foreach (var room in lvl.Session.MapData.Levels)
+                {
+                    // Skip the current room
+                    if (room.Name == roomName)
+                        continue;
+
+                    Rectangle otherBounds = room.Bounds;
+                    Logger.Log(LogLevel.Info, "RLBridge", $"other bounds. Top: {otherBounds.Top} Bottom: {otherBounds.Bottom} Left: {otherBounds.Left} Right: {otherBounds.Right}");
+                    Logger.Log(LogLevel.Info, "RLBridge",
+                            $"other bounds: {otherBounds}");
+
+                    // Celeste/Monocle: +Y is DOWN, -Y is UP.
+                    // Rect convention: Top is the smaller Y value, Bottom is the larger Y value (even if both are negative).
+                    const int maxGap = 16;
+
+                    // RIGHT: other is to the right (higher X)
+                    bool right =
+                        (otherBounds.Left >= currentBounds.Right) &&
+                        (otherBounds.Left - currentBounds.Right <= maxGap) &&
+                        (otherBounds.Bottom > currentBounds.Top) &&
+                        (otherBounds.Top < currentBounds.Bottom);
+
+                    // LEFT: other is to the left (lower X)
+                    bool left =
+                        (otherBounds.Right <= currentBounds.Left) &&
+                        (currentBounds.Left - otherBounds.Right <= maxGap) &&
+                        (otherBounds.Bottom > currentBounds.Top) &&
+                        (otherBounds.Top < currentBounds.Bottom);
+
+                    // DOWN: other is below (higher Y, because +Y is down)
+                    bool down =
+                        (otherBounds.Top >= currentBounds.Bottom) &&
+                        (otherBounds.Top - currentBounds.Bottom <= maxGap) &&
+                        (otherBounds.Right > currentBounds.Left) &&
+                        (otherBounds.Left < currentBounds.Right);
+
+                    // UP: other is above (lower Y, more negative is “more up”)
+                    bool up =
+                        (otherBounds.Bottom <= currentBounds.Top) &&
+                        (currentBounds.Top - otherBounds.Bottom <= maxGap) &&
+                        (otherBounds.Right > currentBounds.Left) &&
+                        (otherBounds.Left < currentBounds.Right);
+
+                    if (right) {
+                        int y0 = Math.Max(currentBounds.Top, otherBounds.Top);
+                        int y1 = Math.Min(currentBounds.Bottom, otherBounds.Bottom);
+                        Vector2 exitPoint = new Vector2(currentBounds.Right, (y0 + y1) * 0.5f);
+                        exits.Add(exitPoint);
+                    }
+
+                    if (left) {
+                        int y0 = Math.Max(currentBounds.Top, otherBounds.Top);
+                        int y1 = Math.Min(currentBounds.Bottom, otherBounds.Bottom);
+                        Vector2 exitPoint = new Vector2(currentBounds.Left, (y0 + y1) * 0.5f);
+                        exits.Add(exitPoint);
+                    }
+
+                    if (down) {
+                        int x0 = Math.Max(currentBounds.Left, otherBounds.Left);
+                        int x1 = Math.Min(currentBounds.Right, otherBounds.Right);
+                        Vector2 exitPoint = new Vector2((x0 + x1) * 0.5f, currentBounds.Bottom);
+                        exits.Add(exitPoint);
+                    }
+
+                    if (up) {
+                        int x0 = Math.Max(currentBounds.Left, otherBounds.Left);
+                        int x1 = Math.Min(currentBounds.Right, otherBounds.Right);
+                        Vector2 exitPoint = new Vector2((x0 + x1) * 0.5f, currentBounds.Top);
+                        exits.Add(exitPoint);
+                    }
+                                    }
+            }
+
+            if (exits.Count > 0)
+            {
+                roomExits[roomName] = exits;
+                Logger.Log(LogLevel.Info, "RLBridge", $"Scanned {exits.Count} exits in room {roomName}");
+            }
+            else
+            {
+                Logger.Log(LogLevel.Warn, "RLBridge", $"No exits found in room {roomName}");
+            }
+        }
+
+        private float GetDistanceToNearestExit(Level lvl, Player pl, string roomName)
+        {
+            if (pl == null || string.IsNullOrEmpty(roomName))
+                return 0f;
+
+            // Get exits for current room
+            if (!roomExits.TryGetValue(roomName, out var exits) || exits.Count == 0)
+                return 0f;
+
+            // Find nearest exit
+            float minDistance = float.MaxValue;
+            foreach (var exitPos in exits)
+            {
+                float distance = Vector2.Distance(pl.Position, exitPos);
+                if (distance < minDistance)
+                    minDistance = distance;
+            }
+
+            return minDistance;
+        }
+
         private float CalculateFrameReward(Level lvl)
         {
             var pl = GetValidPlayer(lvl);
@@ -758,6 +1000,9 @@ namespace RLBridge
                 // Check for room changes
                 if (!string.IsNullOrEmpty(currentRoom) && currentRoom != lastRoom)
                 {
+                    // Scan for exits in new room
+                    ScanForExits(lvl, currentRoom);
+
                     if (!visitedRooms.Contains(currentRoom))
                     {
                         // New room discovered!
@@ -813,6 +1058,26 @@ namespace RLBridge
 
                 // Small time penalty to encourage efficiency
                 reward += STEP_COST;
+
+                // Distance-to-exit reward shaping (exponential decay)
+                // Closer to exit = exponentially higher reward
+                // Normalized by episode progress to encourage efficiency
+                float distanceToExit = GetDistanceToNearestExit(lvl, pl, currentRoom);
+                if (distanceToExit > 0 && distanceToExit < float.MaxValue)
+                {
+                    // Step normalization: exponential decay over episode
+                    // Early episode (step 0): factor = 1.0 (full reward)
+                    // Mid episode (step 20k): factor = 0.37
+                    // Late episode (step 40k): factor = 0.13
+                    // Max episode (step 50k): factor = 0.08 (maintains gradient even at limit)
+                    float stepNormalization = (float)Math.Exp(-episodeSteps / 20000.0f);
+
+                    // reward = e^(-distance * scale) * multiplier * efficiency_factor
+                    // At distance=0, step=0: reward = 1.0 * 5.0 * 1.0 = 5.0
+                    // At distance=1000, step=20k: reward = e^(-1.0) * 5.0 * 0.37 ≈ 0.68
+                    float proximityReward = (float)Math.Exp(-distanceToExit * EXIT_DISTANCE_SCALE) * EXIT_PROXIMITY_MULTIPLIER * stepNormalization;
+                    reward += proximityReward;
+                }
 
                 // Optional: small distance-based reward for progress within a room
                 if (USE_DISTANCE_REWARD)
@@ -1111,7 +1376,7 @@ namespace RLBridge
 
         private InputState DecodeAction(int id)
         {
-            // Reduced action space (13 actions):
+            // Action space (17 actions):
             // 0: Idle
             // 1: Left
             // 2: Right
@@ -1119,13 +1384,16 @@ namespace RLBridge
             // 4: Jump + Left
             // 5: Jump + Right
             // 6: Grab (hold wall)
-            // 7: Climb Jump Left (Grab+Jump+Left)
-            // 8: Climb Jump Right (Grab+Jump+Right)
+            // 7: Climb Up (Grab + Up)
+            // 8: Climb Down (Grab + Down)
             // 9: Dash Left
             // 10: Dash Right
             // 11: Dash Up
             // 12: Dash Up-Left
             // 13: Dash Up-Right
+            // 14: Long Jump (held for 40 frames)
+            // 15: Long Jump + Left (held for 40 frames)
+            // 16: Long Jump + Right (held for 40 frames)
 
             var a = new InputState();
 
@@ -1160,16 +1428,14 @@ namespace RLBridge
                     a.Grab = true;
                     break;
 
-                case 7: // Climb Jump Left
+                case 7: // Climb Up
                     a.Grab = true;
-                    a.JumpTap = true;
-                    a.MoveX = -1;
+                    a.MoveY = -1;
                     break;
 
-                case 8: // Climb Jump Right
+                case 8: // Climb Down
                     a.Grab = true;
-                    a.JumpTap = true;
-                    a.MoveX = 1;
+                    a.MoveY = 1;
                     break;
 
                 case 9: // Dash Left
@@ -1197,6 +1463,20 @@ namespace RLBridge
                     a.Aim = new Vector2(1, -1).SafeNormalize();
                     break;
 
+                case 14: // Long Jump (held for 40 frames via action repeat)
+                    a.JumpTap = true;
+                    break;
+
+                case 15: // Long Jump + Left (held for 40 frames via action repeat)
+                    a.JumpTap = true;
+                    a.MoveX = -1;
+                    break;
+
+                case 16: // Long Jump + Right (held for 40 frames via action repeat)
+                    a.JumpTap = true;
+                    a.MoveX = 1;
+                    break;
+
                 default:
                     // Invalid action, do nothing
                     break;
@@ -1207,32 +1487,76 @@ namespace RLBridge
 
         private void ApplyInput(InputState a)
         {
-            // Set movement direction
-            Input.MoveX.Value = a.MoveX; // -1, 0, or 1
-            Input.MoveY.Value = a.MoveY; // -1, 0, or 1 (for down/crouch)
 
-            // Handle Jump with proper button press injection (tap action)
-            // IMPORTANT: For climbing, we need jump to trigger even when grab is held
+            // Build list of keys to press
+            var keysToPress = new List<Keys>();
+
+            // Movement keys
+            if (a.MoveX < 0) keysToPress.Add(Keys.Left);
+            if (a.MoveX > 0) keysToPress.Add(Keys.Right);
+            if (a.MoveY < 0) keysToPress.Add(Keys.Up);
+            if (a.MoveY > 0) keysToPress.Add(Keys.Down);
+
+            // Action keys
+            if (a.JumpTap) keysToPress.Add(jumpKey);  // C
+            if (a.Grab) keysToPress.Add(grabKey);      // Z
+            if (a.Dash) keysToPress.Add(dashKey);      // X
+
+            // Get current keyboard state
+            var currentState = Keyboard.GetState();
+
+            // Merge with existing keys (preserve any keys the user might be pressing)
+            var existingKeys = currentState.GetPressedKeys();
+            var allKeys = new HashSet<Keys>(keysToPress);
+            foreach (var key in existingKeys)
+            {
+                allKeys.Add(key);
+            }
+
+            // Create new keyboard state
+            var newState = new KeyboardState(allKeys.ToArray());
+
+            // Update state (following TAS pattern)
+
+            MInput.Keyboard.PreviousState = Keyboard.GetState();;
+            MInput.Keyboard.CurrentState = newState;
+
+            // Trigger virtual input update
+            MInput.UpdateVirtualInputs();
+
+            // Also set analog movement for non-keyboard inputs
+            Input.MoveX.Value = a.MoveX;
+            Input.MoveY.Value = a.MoveY;
+            if (a.Dash && a.Aim != Vector2.Zero)
+            {
+                Input.Aim.Value = a.Aim.SafeNormalize();
+            }
+        }
+
+        // Legacy input method (fallback if keyboard state not available)
+        private void ApplyInputLegacy(InputState a)
+        {
+            // Set movement direction
+            Input.MoveX.Value = a.MoveX;
+            Input.MoveY.Value = a.MoveY;
+
+            // Handle Jump
             if (a.JumpTap)
             {
-                // Always force jump when requested, don't track state
-                // This ensures climb jumps and wall kicks work properly
                 ForceButtonPress(Input.Jump);
             }
 
-            // Handle Grab - MUST be held for wall climbing, not just pressed
+            // Handle Grab
             if (a.Grab)
             {
-                // Hold grab button down (needed for wall climbing)
                 ForceButtonHold(Input.Grab);
             }
             else
             {
-                // Release grab button when not in action
                 ForceButtonRelease(Input.Grab);
             }
 
-            // Handle Dash with aim direction (tap action)
+            // Handle Dash
             if (a.Dash)
             {
                 if (a.Aim != Vector2.Zero)
@@ -1255,8 +1579,16 @@ namespace RLBridge
                 }
                 if (buttonCheck != null)
                 {
-                    // Set DebugOverridePressed to true (it's a Nullable<bool>)
-                    buttonCheck.SetValue(button, (bool?)true);
+                    // Set DebugOverridePressed - handle both bool? and Keys? types
+                    if (buttonCheck.FieldType == typeof(bool?))
+                    {
+                        buttonCheck.SetValue(button, (bool?)true);
+                    }
+                    else if (buttonCheck.FieldType == typeof(Keys?))
+                    {
+                        // Use a dummy key to trigger the press
+                        buttonCheck.SetValue(button, (Keys?)Keys.C);
+                    }
                 }
             }
             catch (Exception e)
@@ -1273,7 +1605,21 @@ namespace RLBridge
                 if (buttonCheck != null)
                 {
                     // Keep button held by continuously setting DebugOverridePressed
-                    buttonCheck.SetValue(button, (bool?)true);
+                    if (buttonCheck.FieldType == typeof(bool?))
+                    {
+                        buttonCheck.SetValue(button, (bool?)true);
+                    }
+                    else if (buttonCheck.FieldType == typeof(Keys?))
+                    {
+                        // Use a dummy key to hold the button
+                        buttonCheck.SetValue(button, (Keys?)Keys.V);
+                    }
+                }
+                else if (buttonBuffered != null)
+                {
+                    // Fallback: Simulate hold by repeatedly refreshing buffer
+                    // This keeps the button "pressed" by maintaining buffer counter
+                    buttonBuffered.SetValue(button, 0.1f);
                 }
             }
             catch (Exception e)
@@ -1289,9 +1635,18 @@ namespace RLBridge
             {
                 if (buttonCheck != null)
                 {
-                    // Release by setting DebugOverridePressed to null
-                    buttonCheck.SetValue(button, (bool?)null);
+                    // Release by setting DebugOverridePressed to null (works for both types)
+                    if (buttonCheck.FieldType == typeof(bool?))
+                    {
+                        buttonCheck.SetValue(button, (bool?)null);
+                    }
+                    else if (buttonCheck.FieldType == typeof(Keys?))
+                    {
+                        buttonCheck.SetValue(button, (Keys?)null);
+                    }
                 }
+                // In buffer-only mode, no explicit release needed
+                // Not calling ForceButtonHold will let bufferCounter decay naturally
             }
             catch (Exception e)
             {
@@ -1301,11 +1656,22 @@ namespace RLBridge
 
         private void ClearInput()
         {
-            // Reset all input states
+            var currentState = Keyboard.GetState();
+            var emptyState = new KeyboardState();  // No keys pressed
+
+            MInput.Keyboard.PreviousState = currentState;
+            MInput.Keyboard.CurrentState = emptyState;
+            
+
+            MInput.UpdateVirtualInputs();
+            // Reset analog inputs
             Input.MoveX.Value = 0;
             Input.MoveY.Value = 0;
             Input.Aim.Value = Vector2.Zero;
+        }
 
+        private void ClearInputLegacy()
+        {
             // Clear button buffers to prevent sticking
             Input.Jump.ConsumeBuffer();
             Input.Dash.ConsumeBuffer();
@@ -1316,9 +1682,18 @@ namespace RLBridge
             {
                 try
                 {
-                    buttonCheck.SetValue(Input.Jump, (bool?)null);
-                    buttonCheck.SetValue(Input.Dash, (bool?)null);
-                    buttonCheck.SetValue(Input.Grab, (bool?)null);
+                    if (buttonCheck.FieldType == typeof(bool?))
+                    {
+                        buttonCheck.SetValue(Input.Jump, (bool?)null);
+                        buttonCheck.SetValue(Input.Dash, (bool?)null);
+                        buttonCheck.SetValue(Input.Grab, (bool?)null);
+                    }
+                    else if (buttonCheck.FieldType == typeof(Keys?))
+                    {
+                        buttonCheck.SetValue(Input.Jump, (Keys?)null);
+                        buttonCheck.SetValue(Input.Dash, (Keys?)null);
+                        buttonCheck.SetValue(Input.Grab, (Keys?)null);
+                    }
                 }
                 catch { }
             }
