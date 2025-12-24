@@ -60,13 +60,13 @@ namespace RLBridge
         public bool CaptureFrames { get; set; } = true;
 
         [SettingName("Frame width (0 = full resolution)")]
-        public int FrameWidth { get; set; } = 160;
+        public int FrameWidth { get; set; } = 640;
 
         [SettingName("Frame height (0 = full resolution)")]
-        public int FrameHeight { get; set; } = 120;
+        public int FrameHeight { get; set; } = 360;
 
         [SettingName("Frame color mode")]
-        public FrameColorMode ColorMode { get; set; } = FrameColorMode.LuminanceHue;
+        public FrameColorMode ColorMode { get; set; } = FrameColorMode.Native;
 
         [SettingName("Terminate on stagnation")]
         public bool TerminateOnStagnation { get; set; } = true;
@@ -86,6 +86,7 @@ namespace RLBridge
         RGB,           // 3 channels: Red, Green, Blue
         Grayscale,     // 1 channel: Luminance only
         LuminanceHue,  // 2 channels: Brightness + Color info (best balance)
-        YUV            // 3 channels: Y (luma) + UV (chroma) - efficient for video
+        YUV,           // 3 channels: Y (luma) + UV (chroma) - efficient for video
+        Native         // 3 channels: Raw RGB at native resolution (no downsampling)
     }
 }

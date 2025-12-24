@@ -98,10 +98,10 @@ namespace RLBridge
         private const bool TERMINATE_ON_MAX_STEPS = true;   // Enable max steps termination
 
         // Rewards
-        private const float NEW_ROOM_REWARD = 100000.0f;       // Reward for discovering new room
+        private const float NEW_ROOM_REWARD = 2000.0f;       // Reward for discovering new room
         private const float NEW_CELL_REWARD = 0.0f;         // Reward for discovering new cell
-        private const float EXIT_PROXIMITY_MULTIPLIER = 10.0f; // Multiplier for exit proximity reward
-        private const float EXIT_DISTANCE_SCALE = 0.001f;    // Scale factor for exponential decay (1/1000 pixels)
+        private const float EXIT_PROXIMITY_MULTIPLIER = 200.0f; // Multiplier for exit proximity reward
+        private const float EXIT_DISTANCE_SCALE = 0.01f;    // Scale factor for exponential decay (1/1000 pixels)
 
         // Penalties
         private const float DEATH_PENALTY = -500.0f;         // One-time penalty on death
@@ -113,7 +113,7 @@ namespace RLBridge
 
         // Exploration settings
         private const bool USE_CELL_TRACKING = true;        // Enable grid-based cell tracking
-        private const float CELL_SIZE = 64.0f;              // Pixels per grid cell
+        private const float CELL_SIZE = 16.0f;              // Pixels per grid cell
         private const bool PENALIZE_IDLING = true;          // Apply penalty for staying in same cell
         private const int IDLE_THRESHOLD = 10;              // Frames before idle penalty applies
 
@@ -959,6 +959,14 @@ namespace RLBridge
             if (pl == null || string.IsNullOrEmpty(roomName))
                 return 0f;
 
+            return GetDistanceFromPointToNearestExit(lvl, pl.Position, roomName);
+        }
+
+        private float GetDistanceFromPointToNearestExit(Level lvl, Vector2 position, string roomName)
+        {
+            if (string.IsNullOrEmpty(roomName))
+                return 0f;
+
             // Get exits for current room
             if (!roomExits.TryGetValue(roomName, out var exits) || exits.Count == 0)
                 return 0f;
@@ -967,12 +975,49 @@ namespace RLBridge
             float minDistance = float.MaxValue;
             foreach (var exitPos in exits)
             {
-                float distance = Vector2.Distance(pl.Position, exitPos);
+                float distance = Vector2.Distance(position, exitPos);
                 if (distance < minDistance)
                     minDistance = distance;
             }
 
             return minDistance;
+        }
+
+        // Generate visited cell map for current room
+        // Returns a flat array of bytes (0=unvisited, 255=visited) for the cell grid
+        private List<byte> GenerateVisitedCellMap(Level lvl, string currentRoom)
+        {
+            var visitedMap = new List<byte>();
+
+            if (lvl == null || string.IsNullOrEmpty(currentRoom))
+                return visitedMap;
+
+            // Get room bounds
+            Rectangle roomBounds = lvl.Bounds;
+            int roomWidth = roomBounds.Width;
+            int roomHeight = roomBounds.Height;
+
+            // Calculate grid dimensions (cells are CELL_SIZE pixels)
+            int gridWidth = (int)Math.Ceiling(roomWidth / (float)CELL_SIZE);
+            int gridHeight = (int)Math.Ceiling(roomHeight / (float)CELL_SIZE);
+
+            // Generate map: row-major order (top to bottom, left to right)
+            for (int gridY = 0; gridY < gridHeight; gridY++)
+            {
+                for (int gridX = 0; gridX < gridWidth; gridX++)
+                {
+                    // Calculate cell coordinates relative to room origin
+                    int cellX = (int)(roomBounds.Left / CELL_SIZE) + gridX;
+                    int cellY = (int)(roomBounds.Top / CELL_SIZE) + gridY;
+                    string cellKey = $"{currentRoom}:{cellX},{cellY}";
+
+                    // Check if visited
+                    byte value = (byte)(visitedCells.Contains(cellKey) ? 255 : 0);
+                    visitedMap.Add(value);
+                }
+            }
+
+            return visitedMap;
         }
 
         private float CalculateFrameReward(Level lvl)
@@ -1028,10 +1073,40 @@ namespace RLBridge
                         {
                             // New cell discovered!
                             visitedCells.Add(cellKey);
-                            reward += NEW_CELL_REWARD;
                             stepsSinceLastNewCell = 0;  // Reset stagnation counter
-                            Logger.Log(LogLevel.Info, "RLBridge",
-                                $"[NEW CELL] stepsSinceLastNewCell reset to 0 at episodeStep {episodeSteps}, cell: {cellKey}");
+
+                            // Calculate reward based on cell's distance to nearest exit
+                            // Encourages exploring cells closer to the exit
+                            // Cell center position
+                            float cellCenterX = cellX * CELL_SIZE + CELL_SIZE / 2f;
+                            float cellCenterY = cellY * CELL_SIZE + CELL_SIZE / 2f;
+                            Vector2 cellCenter = new Vector2(cellCenterX, cellCenterY);
+
+                            // Get distance from cell center to nearest exit
+                            float cellToExitDistance = GetDistanceFromPointToNearestExit(lvl, cellCenter, currentRoom);
+
+                            if (cellToExitDistance > 0 && cellToExitDistance < float.MaxValue)
+                            {
+                                // Step normalization for efficiency (same as before)
+                                // Early episode: full reward, late episode: reduced reward
+                                float stepNormalization = (float)Math.Exp(-episodeSteps / 20000.0f);
+
+                                // Reward = e^(-distance * scale) * multiplier * efficiency
+                                // Closer to exit = higher reward, faster discovery = higher reward
+                                float cellExplorationReward = (float)Math.Exp(-cellToExitDistance * EXIT_DISTANCE_SCALE)
+                                    * EXIT_PROXIMITY_MULTIPLIER * stepNormalization;
+                                reward += cellExplorationReward;
+
+                                Logger.Log(LogLevel.Info, "RLBridge",
+                                    $"[NEW CELL] {cellKey} @ step {episodeSteps}: dist={cellToExitDistance:F1}, reward={cellExplorationReward:F2}, norm={stepNormalization:F3}");
+                            }
+                            else
+                            {
+                                // No exit found, use flat reward (shouldn't happen often)
+                                reward += NEW_CELL_REWARD;
+                                Logger.Log(LogLevel.Info, "RLBridge",
+                                    $"[NEW CELL] {cellKey} discovered (no exit detected)");
+                            }
                         }
                         else
                         {
@@ -1059,25 +1134,9 @@ namespace RLBridge
                 // Small time penalty to encourage efficiency
                 reward += STEP_COST;
 
-                // Distance-to-exit reward shaping (exponential decay)
-                // Closer to exit = exponentially higher reward
-                // Normalized by episode progress to encourage efficiency
-                float distanceToExit = GetDistanceToNearestExit(lvl, pl, currentRoom);
-                if (distanceToExit > 0 && distanceToExit < float.MaxValue)
-                {
-                    // Step normalization: exponential decay over episode
-                    // Early episode (step 0): factor = 1.0 (full reward)
-                    // Mid episode (step 20k): factor = 0.37
-                    // Late episode (step 40k): factor = 0.13
-                    // Max episode (step 50k): factor = 0.08 (maintains gradient even at limit)
-                    float stepNormalization = (float)Math.Exp(-episodeSteps / 20000.0f);
-
-                    // reward = e^(-distance * scale) * multiplier * efficiency_factor
-                    // At distance=0, step=0: reward = 1.0 * 5.0 * 1.0 = 5.0
-                    // At distance=1000, step=20k: reward = e^(-1.0) * 5.0 * 0.37 ≈ 0.68
-                    float proximityReward = (float)Math.Exp(-distanceToExit * EXIT_DISTANCE_SCALE) * EXIT_PROXIMITY_MULTIPLIER * stepNormalization;
-                    reward += proximityReward;
-                }
+                // Exit proximity reward is now only given on new cell discovery
+                // (see cell exploration section above)
+                // This prevents reward farming by camping near exits
 
                 // Optional: small distance-based reward for progress within a room
                 if (USE_DISTANCE_REWARD)
@@ -1189,13 +1248,24 @@ namespace RLBridge
                 Math.Min(stepsSinceLastNewCell / (float)STAGNATION_THRESHOLD, 1.0f);
             float episodeProgress = Math.Min(episodeSteps / (float)MAX_EPISODE_STEPS, 1.0f);
 
+            // Generate visited cell map for current room
+            List<byte> visitedMap = GenerateVisitedCellMap(lvl, currentRoom);
+
+            // Calculate grid dimensions for visited map
+            Rectangle roomBounds = lvl.Bounds;
+            int gridWidth = (int)Math.Ceiling(roomBounds.Width / (float)CELL_SIZE);
+            int gridHeight = (int)Math.Ceiling(roomBounds.Height / (float)CELL_SIZE);
+
             var obs = new {
                 px, py, vx, vy, onGround, dashes, stamina,
                 frame = frameBase64,
                 frameWidth,
                 frameHeight,
                 stagnationProgress,  // 0-1: How close to stagnation termination
-                episodeProgress      // 0-1: How far through episode
+                episodeProgress,     // 0-1: How far through episode
+                visitedMap,          // Flat array of bytes (0=unvisited, 255=visited)
+                visitedMapWidth = gridWidth,   // Grid width (in cells)
+                visitedMapHeight = gridHeight  // Grid height (in cells)
             };
 
             var info = new {
@@ -1245,6 +1315,28 @@ namespace RLBridge
             // Read from back buffer
             var srcBuffer = new Color[srcWidth * srcHeight];
             gd.GetBackBufferData(srcBuffer);
+
+            // NATIVE MODE: Return raw backbuffer RGB without interpolation
+            if (Settings.ColorMode == FrameColorMode.Native)
+            {
+                Logger.Log(LogLevel.Info, "RLBridge",
+                    $"Native mode: Capturing at {srcWidth}x{srcHeight} resolution");
+
+                width = srcWidth;
+                height = srcHeight;
+
+                var nativeResult = new byte[width * height * 3];  // RGB format
+
+                for (int i = 0; i < srcBuffer.Length; i++)
+                {
+                    var c = srcBuffer[i];
+                    nativeResult[i * 3 + 0] = c.R;
+                    nativeResult[i * 3 + 1] = c.G;
+                    nativeResult[i * 3 + 2] = c.B;
+                }
+
+                return nativeResult;
+            }
 
             // Determine bytes per pixel based on color mode
             int bytesPerPixel = Settings.ColorMode switch
