@@ -8,6 +8,7 @@ using System.Net.Sockets;
 using System.Reflection;
 using System.Text;
 using System.Text.Json;
+using System.Threading;
 
 using Celeste;
 using Microsoft.Xna.Framework;
@@ -57,7 +58,7 @@ namespace RLBridge
         private bool vsyncDisabled = false;
 
         // Progress tracking for rewards (you can customize)
-        private float maxXProgress = 0f;  // Maximum X position reached (rightward progress)
+        private float lastCellDistanceToExit = float.MaxValue;  // Last cell's distance to exit (for potential-based shaping)
         private float startX = 0f;        // Starting X position for the episode
 
         // Room-based progression tracking
@@ -67,14 +68,16 @@ namespace RLBridge
         // Exit tracking (room adjacency from Level.Bounds)
         private Dictionary<string, List<Vector2>> roomExits = new Dictionary<string, List<Vector2>>();
         private string lastExitScanRoom = "";
+        private Vector2? entryExitPoint = null;  // The exit we entered through (exclude from nearest exit calc)
+        private const float ENTRY_EXIT_EXCLUSION_RADIUS = 50f;  // Pixels - exclude exits within this radius of entry point
 
-        // Cell-based exploration tracking (grid within rooms)
-        private HashSet<string> visitedCells = new HashSet<string>();
+        // Cell position tracking (for distance-based rewards)
         private string lastCellKey = "";
         private int framesInCurrentCell = 0;  // Track how long in same cell
 
-        // Episode termination tracking
-        private int stepsSinceLastNewCell = 0;
+        // Episode termination tracking (distance-based stagnation)
+        private float bestDistanceToExit = float.MaxValue;  // Best (lowest) distance achieved this episode
+        private int stepsSinceDistanceImproved = 0;         // Steps since we got closer to exit
         private int episodeSteps = 0;
 
         // Death tracking (to apply penalty only once)
@@ -94,40 +97,38 @@ namespace RLBridge
 
         // Warmup period at episode start before stagnation detection applies (in agent steps, not frames)
         // With action_repeat=4, 75 steps = 300 frames
-        private const int STAGNATION_WARMUP_STEPS = 3600;  // First 300 frames (75 steps @ action_repeat=4)
+        private const int STAGNATION_WARMUP_STEPS = 10;  // First 300 frames (75 steps @ action_repeat=4)
 
         // ======== REWARD/PENALTY/THRESHOLD CONFIGURATION ========
         // Edit these values directly instead of using the settings menu
 
         // Episode termination thresholds
-        private const int STAGNATION_THRESHOLD = 1800;        // Frames without discovering new cell
+        private const int STAGNATION_THRESHOLD = 160;        // Frames without getting closer to exit
         private const int MAX_EPISODE_STEPS = 50000;         // Maximum frames per episode
-        private const bool TERMINATE_ON_STAGNATION = true;  // Enable stagnation termination
+        private const bool TERMINATE_ON_STAGNATION = true;  // Enable distance-based stagnation termination
         private const bool TERMINATE_ON_MAX_STEPS = true;   // Enable max steps termination
 
-        // Rewards
-        private const float NEW_ROOM_REWARD = 2000.0f;       // Reward for discovering new room
-        private const float NEW_CELL_REWARD = 0.0f;         // Reward for discovering new cell
-        private const float EXIT_PROXIMITY_MULTIPLIER = 500.0f; // Multiplier for exit proximity reward
-        private const float EXIT_DISTANCE_SCALE = 0.015f;    // Scale factor for exponential decay (1/1000 pixels)
+        // Room rewards
+        private const float NEW_ROOM_REWARD = 2.0f;        // Reward for discovering new room
+        private const float REVISIT_ROOM_PENALTY = -.50f;  // Penalty for backtracking to visited room (heavy to prevent bouncing)
 
         // Penalties
-        private const float DEATH_PENALTY = -500.0f;         // One-time penalty on death
-        private const float STAGNATION_PENALTY = -250f;     // One-time penalty on stagnation termination
-        private const float REVISIT_ROOM_PENALTY = -1.0f;   // Penalty for backtracking to visited room
-        private const float REVISIT_CELL_PENALTY = 0f;  // Penalty for revisiting cell
-        private const float STEP_COST = 0f;             // Per-step cost to encourage efficiency
-        private const float IDLE_PENALTY_RATE = -0.01f;     // Per-frame penalty when idle in same cell
+        private const float DEATH_PENALTY = -.50f;         // One-time penalty on death
+        private const float STAGNATION_PENALTY = -.25f;    // One-time penalty on stagnation termination
+        private const float STEP_COST = -0.001f;          // Per-step cost to encourage efficiency
+        private const float IDLE_PENALTY_RATE = 0;         // Per-frame penalty when idle in same cell
 
-        // Exploration settings
-        private const bool USE_CELL_TRACKING = true;        // Enable grid-based cell tracking
-        private const float CELL_SIZE = 16.0f;              // Pixels per grid cell
-        private const bool PENALIZE_IDLING = true;          // Apply penalty for staying in same cell
-        private const int IDLE_THRESHOLD = 30;              // Frames before idle penalty applies
+        // Cell tracking settings (for distance-based rewards)
+        private const float CELL_SIZE = 16.0f;             // Pixels per grid cell
+        private const bool PENALIZE_IDLING = true;         // Apply penalty for staying in same cell
+        private const int IDLE_THRESHOLD = 30;             // Frames before idle penalty applies
 
-        // Distance-based reward (optional)
-        private const bool USE_DISTANCE_REWARD = true;     // Enable rightward progress reward
-        private const float PROGRESS_SCALE = 0.01f;         // Scale factor for distance reward
+        // Potential-based exit proximity reward (cell-level) with sqrt shaping
+        // φ(d) = -sqrt(d), reward = sqrt(d_old) - sqrt(d_new)
+        // This gives higher rewards near the exit (steeper gradient)
+        // For 300px room: total cumulative reward ≈ sqrt(300) * PROGRESS_SCALE ≈ 3.5
+        private const bool USE_DISTANCE_REWARD = true;     // Enable exit proximity reward
+        private const float PROGRESS_SCALE = 0.2f;         // Scale for sqrt-shaped distance reward
 
         // ======== END CONFIGURATION ========
 
@@ -183,15 +184,11 @@ namespace RLBridge
             // Validate the type - accept both Nullable<bool> and Nullable<Keys>
             if (buttonCheck != null && buttonCheck.FieldType != typeof(bool?) && buttonCheck.FieldType != typeof(Keys?))
             {
-                Logger.Log(LogLevel.Warn, "RLBridge",
-                    $"Found DebugOverridePressed but incompatible type: {buttonCheck.FieldType.Name}. Using buffer-only mode for inputs.");
                 buttonCheck = null;
             }
 
             if (buttonCheck != null)
             {
-                Logger.Log(LogLevel.Info, "RLBridge",
-                    $"Found DebugOverridePressed field with type: {buttonCheck.FieldType.Name}");
             }
 
             // Get the Binding field
@@ -201,12 +198,10 @@ namespace RLBridge
             if (buttonBinding != null)
             {
                 Type bindingType = buttonBinding.FieldType;
-                Logger.Log(LogLevel.Info, "RLBridge", $"Found Binding field, investigating {bindingType.Name} type:");
 
                 // List all Binding fields
                 foreach (var field in bindingType.GetFields(BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public))
                 {
-                    Logger.Log(LogLevel.Info, "RLBridge", $"  Binding field: {field.Name} ({field.FieldType.FullName})");
                 }
 
                 // Try to find a pressed state field in Binding
@@ -218,7 +213,6 @@ namespace RLBridge
 
                 if (bindingPressed != null)
                 {
-                    Logger.Log(LogLevel.Info, "RLBridge", $"Found Binding.pressed field: {bindingPressed.FieldType.FullName}");
                 }
             }
 
@@ -231,13 +225,10 @@ namespace RLBridge
                 if (listType.IsGenericType && listType.GetGenericArguments().Length > 0)
                 {
                     Type nodeType = listType.GetGenericArguments()[0];
-                    Logger.Log(LogLevel.Info, "RLBridge", $"Found Node type: {nodeType.FullName}");
-                    Logger.Log(LogLevel.Info, "RLBridge", "Node type members:");
 
                     // List all fields in Node
                     foreach (var field in nodeType.GetFields(BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public))
                     {
-                        Logger.Log(LogLevel.Info, "RLBridge", $"  Node field: {field.Name} ({field.FieldType.FullName})");
                     }
 
                     // List all methods in Node
@@ -245,7 +236,6 @@ namespace RLBridge
                     {
                         if (method.Name.Contains("Check") || method.Name.Contains("Press") || method.Name.Contains("Update"))
                         {
-                            Logger.Log(LogLevel.Info, "RLBridge", $"  Node method: {method.Name}");
                         }
                     }
                 }
@@ -264,36 +254,25 @@ namespace RLBridge
 
                 if (kbCurrentState != null && kbPreviousState != null)
                 {
-                    Logger.Log(LogLevel.Info, "RLBridge",
-                        "Successfully found keyboard state fields - will use direct keyboard injection");
                 }
                 else
                 {
-                    Logger.Log(LogLevel.Error, "RLBridge",
-                        "Failed to find keyboard state fields - input will not work!");
                 }
             }
 
             if (buttonBuffered == null)
             {
-                Logger.Log(LogLevel.Error, "RLBridge", "CRITICAL: Could not find bufferCounter field - button input will NOT work!");
 
                 // List all fields for debugging
-                Logger.Log(LogLevel.Error, "RLBridge", "Available VirtualButton fields:");
                 foreach (var field in vbType.GetFields(BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public))
                 {
-                    Logger.Log(LogLevel.Error, "RLBridge", $"  - {field.Name} ({field.FieldType.FullName})");
                 }
             }
             else if (buttonCheck == null)
             {
-                Logger.Log(LogLevel.Info, "RLBridge",
-                    "Using buffer-only mode for button inputs (DebugOverridePressed not available). Grab/climb will use repeated buffering.");
             }
             else
             {
-                Logger.Log(LogLevel.Info, "RLBridge",
-                    "Successfully found VirtualButton fields: bufferCounter and DebugOverridePressed");
             }
 
             // Start TCP server (localhost only)
@@ -304,17 +283,14 @@ namespace RLBridge
             if (!string.IsNullOrEmpty(envPort) && int.TryParse(envPort, out int parsedPort))
             {
                 port = parsedPort;
-                Logger.Log(LogLevel.Info, "RLBridge", $"Using port from RLBRIDGE_PORT environment variable: {port}");
             }
             else if (Settings.TcpPort != DefaultPort)
             {
                 port = Settings.TcpPort;
-                Logger.Log(LogLevel.Info, "RLBridge", $"Using port from settings: {port}");
             }
 
             server = new JsonLServer(IPAddress.Loopback, port, HandleMessage);
             server.Start();
-            Logger.Log(LogLevel.Info, "RLBridge", $"Started JSONL server at 127.0.0.1:{port}");
         }
 
         public override void Unload()
@@ -341,32 +317,6 @@ namespace RLBridge
         {
             try
             {
-                // Disable VSync once when we know graphics device is ready
-                if (!vsyncDisabled)
-                {
-                    try
-                    {
-                        // Disable fixed timestep (allows variable frame rate)
-                        Engine.Instance.IsFixedTimeStep = false;
-
-                        // Set target to run as fast as possible (TimeSpan.Zero = unlimited)
-                        Engine.Instance.TargetElapsedTime = System.TimeSpan.Zero;
-
-                        // Disable VSync
-                        Engine.Instance.GraphicsDevice.PresentationParameters.PresentationInterval = PresentInterval.Immediate;
-
-                        // Don't sleep between frames
-                        Engine.Instance.InactiveSleepTime = System.TimeSpan.Zero;
-
-                        Logger.Log(LogLevel.Info, "RLBridge", "Disabled VSync and frame rate limits for unlimited frame rate");
-                        vsyncDisabled = true;
-                    }
-                    catch (Exception e)
-                    {
-                        Logger.Log(LogLevel.Warn, "RLBridge", $"Failed to disable VSync: {e.Message}");
-                        vsyncDisabled = true; // Don't keep trying
-                    }
-                }
 
                 // Track Level_Update call rate
                 levelUpdateCallCount++;
@@ -443,7 +393,6 @@ namespace RLBridge
                     if (p0 != null)
                     {
                         startX = p0.X;
-                        maxXProgress = p0.X;
                     }
 
                     // Reset room tracking and pre-fill with starting room
@@ -456,21 +405,33 @@ namespace RLBridge
                     }
                     lastRoom = currentRoomName;
 
-                    // Reset cell tracking and pre-fill with starting cells
-                    visitedCells.Clear();
+                    // Reset cell tracking and initialize distance for potential-based reward
                     var pl = self.Tracker?.GetEntity<Player>();
                     if (pl != null)
                     {
                         int startCellX = (int)Math.Floor(pl.Position.X / CELL_SIZE);
                         int startCellY = (int)Math.Floor(pl.Position.Y / CELL_SIZE);
-                        string startCellKey = $"{currentRoomName}:{startCellX},{startCellY}";
-                        visitedCells.Add(startCellKey);
+
+                        // Initialize distance for potential-based reward
+                        float cellCenterX = startCellX * CELL_SIZE + CELL_SIZE / 2f;
+                        float cellCenterY = startCellY * CELL_SIZE + CELL_SIZE / 2f;
+                        Vector2 cellCenter = new Vector2(cellCenterX, cellCenterY);
+                        lastCellDistanceToExit = GetDistanceFromPointToNearestExit(self, cellCenter, currentRoomName);
+
+                        // Set lastCellKey to spawn cell so first step doesn't trigger spurious cell change
+                        lastCellKey = $"{currentRoomName}:{startCellX},{startCellX}";
                     }
-                    lastCellKey = "";
+                    else
+                    {
+                        lastCellDistanceToExit = float.MaxValue;
+                        lastCellKey = "";
+                    }
                     framesInCurrentCell = 0;
 
-                    // Reset episode tracking
-                    stepsSinceLastNewCell = 0;
+                    // Reset episode tracking (distance-based stagnation)
+                    // Initialize bestDistanceToExit from starting position
+                    bestDistanceToExit = lastCellDistanceToExit;
+                    stepsSinceDistanceImproved = 0;
                     episodeSteps = 0;
                     hasDied = false;
                     hasStagnated = false;
@@ -479,6 +440,7 @@ namespace RLBridge
                     setSpawnPoint = false;
                     lastExitScanRoom = "";
                     needsPostReloadSetup = false;
+                    entryExitPoint = null;  // No entry exit for spawn room (we spawned here, didn't enter)
 
                     // Mark that we need to send observation after reset
                     responseSent = false;
@@ -527,15 +489,11 @@ namespace RLBridge
                         if (consecutiveTransitionErrors <= MAX_TRANSITION_RETRIES)
                         {
                             // Transition race condition - wait for next frame to retry
-                            Logger.Log(LogLevel.Debug, "RLBridge",
-                                $"Transition race condition (retry {consecutiveTransitionErrors}/{MAX_TRANSITION_RETRIES})");
                             transitionError = true;
                         }
                         else
                         {
                             // Too many retries - let outer handler deal with it
-                            Logger.Log(LogLevel.Warn, "RLBridge",
-                                $"Transition failed after {MAX_TRANSITION_RETRIES} retries, aborting");
                             throw;
                         }
                     }
@@ -561,7 +519,8 @@ namespace RLBridge
                     hasDied = true;
                 }
 
-                hasStagnated = TERMINATE_ON_STAGNATION && episodeSteps >= STAGNATION_WARMUP_STEPS && stepsSinceLastNewCell >= STAGNATION_THRESHOLD;
+                // Distance-based stagnation: terminate if not getting closer to exit
+                hasStagnated = TERMINATE_ON_STAGNATION && episodeSteps >= STAGNATION_WARMUP_STEPS && stepsSinceDistanceImproved >= STAGNATION_THRESHOLD;
 
                 // Accumulate rewards during action repeat frames (only when stable)
                 if (isRunningStep && !(hasDied || hasStagnated))
@@ -575,7 +534,6 @@ namespace RLBridge
                     }
                     catch (Exception e)
                     {
-                        Logger.Log(LogLevel.Warn, "RLBridge", $"Failed to calculate reward: {e.Message}");
                     }
                 }
 
@@ -606,7 +564,6 @@ namespace RLBridge
                         }
 
                         perfTimer.Restart();
-                        Logger.Log(LogLevel.Debug, "RLBridge", $"Sending observation (done={done})");
                         server.TrySend(new { obs, reward = accumulatedReward, done, info });
                         timeSendResponse += perfTimer.Elapsed.TotalMilliseconds;
 
@@ -621,32 +578,23 @@ namespace RLBridge
                             double totalCSharp = timeGameUpdate + timeRewardCalc + timeObsRead + timeSendResponse;
                             double elapsedTime = (Engine.Scene?.TimeActive ?? 0.0) - levelUpdateStartTime;
                             double updateFPS = elapsedTime > 0 ? levelUpdateCallCount / elapsedTime : 0;
-
-                            Logger.Log(LogLevel.Info, "RLBridge",
-                                $"C# Timing (avg per step): GameUpdate={timeGameUpdate/perfSteps:F2}ms, " +
-                                $"RewardCalc={timeRewardCalc/perfSteps:F2}ms, " +
-                                $"ObsRead={timeObsRead/perfSteps:F2}ms, " +
-                                $"SendResponse={timeSendResponse/perfSteps:F2}ms, " +
-                                $"FrameCapture={timeFrameCapture/perfSteps:F2}ms, " +
-                                $"TOTAL={totalCSharp/perfSteps:F2}ms");
-
-                            Logger.Log(LogLevel.Info, "RLBridge",
-                                $"Level_Update call rate: {updateFPS:F1} FPS (target: {Settings.SpeedMultiplier * 60} FPS), " +
-                                $"Total calls: {levelUpdateCallCount}, Elapsed: {elapsedTime:F2}s");
                         }
                     }
                     catch (Exception e)
                     {
-                        Logger.Log(LogLevel.Error, "RLBridge", $"Failed to send observation: {e.Message}");
-                        Logger.Log(LogLevel.Error, "RLBridge", $"Stack trace: {e.StackTrace}");
                         responseSent = true;  // Mark as sent to avoid getting stuck
                     }
+                }
+
+                // Sleep when idle to reduce CPU usage (waiting for Python command)
+                // Only sleep if we're not processing steps, not resetting, and response is sent
+                if (responseSent && framesToRun == 0 && !pendingReset)
+                {
+                    Thread.Sleep(1);  // 1ms sleep to yield CPU
                 }
             }
             catch (Exception e)
             {
-                Logger.Log(LogLevel.Error, "RLBridge", $"Critical error in Level_Update: {e.Message}");
-                Logger.Log(LogLevel.Error, "RLBridge", $"Stack trace: {e.StackTrace}");
 
                 // If Python is waiting for a response, send an error response to unblock it
                 if (!responseSent && framesToRun >= 0)
@@ -667,7 +615,7 @@ namespace RLBridge
                             stagnated = false,
                             maxStepsReached = false,
                             episodeSteps = 0,
-                            stepsSinceLastNewCell = 0,
+                            stepsSinceDistanceImproved = 0,
                             room = "",
                             area = "",
                             roomsVisited = 0,
@@ -823,11 +771,8 @@ namespace RLBridge
                         break;
 
                     case "reset":
-                        resetSlot = root.TryGetProperty("slot", out var s) ? s.GetInt32() : 0;
                         pendingReset = true;
-                        resetDelayFrames =  500; // Wait 5 frames before resetting
-                        // Immediate ack; the next Level.Update will send a full obs packet
-                        server.TrySend(new { ok = true });
+                        resetDelayFrames =  5; // Wait 5 frames before resetting
                         break;
 
                     case "step":
@@ -841,8 +786,6 @@ namespace RLBridge
                     case "set_render":
                         bool enabled = root.GetProperty("enabled").GetBoolean();
                         renderingEnabled = enabled;
-                        Logger.Log(LogLevel.Info, "RLBridge",
-                            $"Rendering {(enabled ? "enabled" : "disabled")}");
                         server.TrySend(new { ok = true });
                         break;
 
@@ -873,7 +816,6 @@ namespace RLBridge
             // Check all rooms in the map for adjacency
             if (lvl.Session?.MapData?.Levels != null)
             {
-                Logger.Log(LogLevel.Info, "RLBridge", $"current bounds. Top: {currentBounds.Top} Bottom: {currentBounds.Bottom} Left: {currentBounds.Left} Right: {currentBounds.Right}");
                 foreach (var room in lvl.Session.MapData.Levels)
                 {
                     // Skip the current room
@@ -881,9 +823,6 @@ namespace RLBridge
                         continue;
 
                     Rectangle otherBounds = room.Bounds;
-                    Logger.Log(LogLevel.Info, "RLBridge", $"other bounds. Top: {otherBounds.Top} Bottom: {otherBounds.Bottom} Left: {otherBounds.Left} Right: {otherBounds.Right}");
-                    Logger.Log(LogLevel.Info, "RLBridge",
-                            $"other bounds: {otherBounds}");
 
                     // Celeste/Monocle: +Y is DOWN, -Y is UP.
                     // Rect convention: Top is the smaller Y value, Bottom is the larger Y value (even if both are negative).
@@ -950,11 +889,9 @@ namespace RLBridge
             if (exits.Count > 0)
             {
                 roomExits[roomName] = exits;
-                Logger.Log(LogLevel.Info, "RLBridge", $"Scanned {exits.Count} exits in room {roomName}");
             }
             else
             {
-                Logger.Log(LogLevel.Warn, "RLBridge", $"No exits found in room {roomName}");
             }
         }
 
@@ -975,53 +912,37 @@ namespace RLBridge
             if (!roomExits.TryGetValue(roomName, out var exits) || exits.Count == 0)
                 return 0f;
 
-            // Find nearest exit
+            // Find nearest exit, excluding the entry exit (the one we came through)
             float minDistance = float.MaxValue;
+            int validExitCount = 0;
             foreach (var exitPos in exits)
             {
+                // Skip exits near the entry point (the exit we entered through)
+                if (entryExitPoint.HasValue &&
+                    Vector2.Distance(exitPos, entryExitPoint.Value) < ENTRY_EXIT_EXCLUSION_RADIUS)
+                {
+                    continue;
+                }
+
+                validExitCount++;
                 float distance = Vector2.Distance(position, exitPos);
                 if (distance < minDistance)
                     minDistance = distance;
             }
 
-            return minDistance;
-        }
-
-        // Generate visited cell map for current room
-        // Returns a flat array of bytes (0=unvisited, 255=visited) for the cell grid
-        private List<byte> GenerateVisitedCellMap(Level lvl, string currentRoom)
-        {
-            var visitedMap = new List<byte>();
-
-            if (lvl == null || string.IsNullOrEmpty(currentRoom))
-                return visitedMap;
-
-            // Get room bounds
-            Rectangle roomBounds = lvl.Bounds;
-            int roomWidth = roomBounds.Width;
-            int roomHeight = roomBounds.Height;
-
-            // Calculate grid dimensions (cells are CELL_SIZE pixels)
-            int gridWidth = (int)Math.Ceiling(roomWidth / (float)CELL_SIZE);
-            int gridHeight = (int)Math.Ceiling(roomHeight / (float)CELL_SIZE);
-
-            // Generate map: row-major order (top to bottom, left to right)
-            for (int gridY = 0; gridY < gridHeight; gridY++)
+            // If all exits were excluded (single-exit room or all exits are entry),
+            // fall back to including all exits
+            if (validExitCount == 0)
             {
-                for (int gridX = 0; gridX < gridWidth; gridX++)
+                foreach (var exitPos in exits)
                 {
-                    // Calculate cell coordinates relative to room origin
-                    int cellX = (int)(roomBounds.Left / CELL_SIZE) + gridX;
-                    int cellY = (int)(roomBounds.Top / CELL_SIZE) + gridY;
-                    string cellKey = $"{currentRoom}:{cellX},{cellY}";
-
-                    // Check if visited
-                    byte value = (byte)(visitedCells.Contains(cellKey) ? 255 : 0);
-                    visitedMap.Add(value);
+                    float distance = Vector2.Distance(position, exitPos);
+                    if (distance < minDistance)
+                        minDistance = distance;
                 }
             }
 
-            return visitedMap;
+            return minDistance;
         }
 
         private float CalculateFrameReward(Level lvl)
@@ -1037,7 +958,8 @@ namespace RLBridge
             {
                 // Increment episode step counter (only when alive)
                 episodeSteps++;
-                stepsSinceLastNewCell++;
+                // Will be reset if we get closer to exit
+                stepsSinceDistanceImproved++;  
                 // Calculate cell coordinates (divide position by cell size)
                 int cellX = (int)(pl.X / CELL_SIZE);
                 int cellY = (int)(pl.Y / CELL_SIZE);
@@ -1049,12 +971,29 @@ namespace RLBridge
                     // Scan for exits in new room
                     ScanForExits(lvl, currentRoom);
 
+                    // Set entry exit point = nearest exit to player's current position
+                    // This is the exit we just came through - we'll exclude it from distance calculations
+                    if (roomExits.TryGetValue(currentRoom, out var newRoomExits) && newRoomExits.Count > 0)
+                    {
+                        float minDist = float.MaxValue;
+                        Vector2 nearestExit = newRoomExits[0];
+                        foreach (var exit in newRoomExits)
+                        {
+                            float dist = Vector2.Distance(pl.Position, exit);
+                            if (dist < minDist)
+                            {
+                                minDist = dist;
+                                nearestExit = exit;
+                            }
+                        }
+                        entryExitPoint = nearestExit;
+                    }
+
                     if (!visitedRooms.Contains(currentRoom))
                     {
                         // New room discovered!
                         visitedRooms.Add(currentRoom);
                         reward += NEW_ROOM_REWARD;
-                        Logger.Log(LogLevel.Info, "RLBridge", $"New room discovered: {currentRoom} (total: {visitedRooms.Count})");
                     }
                     else
                     {
@@ -1062,92 +1001,64 @@ namespace RLBridge
                         reward += REVISIT_ROOM_PENALTY;
                     }
                     lastRoom = currentRoom;
+
+                    // Reset distance tracking for new room
+                    // Prevents comparing distances across different rooms (different exit locations)
+                    lastCellDistanceToExit = float.MaxValue;
+                    bestDistanceToExit = float.MaxValue;
                 }
 
-                // Check for new cell exploration
-                if (USE_CELL_TRACKING)
+                // Cell change tracking and distance-based rewards
+                if (cellKey != lastCellKey)
                 {
-                    if (cellKey != lastCellKey)
+                    // Changed cells - calculate distance reward
+                    if (USE_DISTANCE_REWARD)
                     {
-                        // Changed cells
-                        if (!visitedCells.Contains(cellKey))
+                        float cellCenterX = cellX * CELL_SIZE + CELL_SIZE / 2f;
+                        float cellCenterY = cellY * CELL_SIZE + CELL_SIZE / 2f;
+                        Vector2 cellCenter = new Vector2(cellCenterX, cellCenterY);
+                        float currentCellDistance = GetDistanceFromPointToNearestExit(lvl, cellCenter, currentRoom);
+
+                        if (currentCellDistance > 0 && currentCellDistance < float.MaxValue &&
+                            lastCellDistanceToExit < float.MaxValue)
                         {
-                            // New cell discovered!
-                            visitedCells.Add(cellKey);
-                            stepsSinceLastNewCell = 0;  // Reset stagnation counter
+                            // Sqrt potential-based reward: φ(d) = -sqrt(d)
+                            // reward = sqrt(d_old) - sqrt(d_new)
+                            // Gives ~4x higher reward near exit vs far away
+                            float oldPotential = (float)Math.Sqrt(lastCellDistanceToExit);
+                            float newPotential = (float)Math.Sqrt(currentCellDistance);
+                            float shapedReward = (oldPotential - newPotential) * PROGRESS_SCALE;
+                            reward += shapedReward;
 
-                            // Calculate reward based on cell's distance to nearest exit
-                            // Encourages exploring cells closer to the exit
-                            // Cell center position
-                            float cellCenterX = cellX * CELL_SIZE + CELL_SIZE / 2f;
-                            float cellCenterY = cellY * CELL_SIZE + CELL_SIZE / 2f;
-                            Vector2 cellCenter = new Vector2(cellCenterX, cellCenterY);
-
-                            // Get distance from cell center to nearest exit
-                            float cellToExitDistance = GetDistanceFromPointToNearestExit(lvl, cellCenter, currentRoom);
-
-                            if (cellToExitDistance > 0 && cellToExitDistance < float.MaxValue)
+                            // Distance-based stagnation: reset counter if we improved best distance
+                            if (currentCellDistance < bestDistanceToExit)
                             {
-                                // Step normalization for efficiency (same as before)
-                                // Early episode: full reward, late episode: reduced reward
-                                float stepNormalization = (float)Math.Exp(-episodeSteps / 20000.0f);
-
-                                // Reward = e^(-distance * scale) * multiplier * efficiency
-                                // Closer to exit = higher reward, faster discovery = higher reward
-                                float cellExplorationReward = (float)Math.Exp(-cellToExitDistance * EXIT_DISTANCE_SCALE)
-                                    * EXIT_PROXIMITY_MULTIPLIER * stepNormalization;
-                                reward += cellExplorationReward;
-
-                                Logger.Log(LogLevel.Info, "RLBridge",
-                                    $"[NEW CELL] {cellKey} @ step {episodeSteps}: dist={cellToExitDistance:F1}, reward={cellExplorationReward:F2}, norm={stepNormalization:F3}");
-                            }
-                            else
-                            {
-                                // No exit found, use flat reward (shouldn't happen often)
-                                reward += NEW_CELL_REWARD;
-                                Logger.Log(LogLevel.Info, "RLBridge",
-                                    $"[NEW CELL] {cellKey} discovered (no exit detected)");
+                                bestDistanceToExit = currentCellDistance;
+                                stepsSinceDistanceImproved = 0;
                             }
                         }
-                        else
-                        {
-                            // Revisiting a cell (backtracking within room)
-                            reward += REVISIT_CELL_PENALTY;
-                        }
-                        lastCellKey = cellKey;
-                        framesInCurrentCell = 0;  // Reset duration counter
+
+                        // Update for next cell change
+                        lastCellDistanceToExit = currentCellDistance;
                     }
-                    else
-                    {
-                        // Still in same cell - increment duration
-                        framesInCurrentCell++;
 
-                        // Apply penalty if staying too long in same cell
-                        // Don't scale by speed - agent needs same number of frames regardless of simulation speed
-                        if (PENALIZE_IDLING && framesInCurrentCell > IDLE_THRESHOLD)
-                        {
-                            // Flat penalty per frame (linear, not quadratic)
-                            reward += IDLE_PENALTY_RATE;
-                        }
+                    lastCellKey = cellKey;
+                    framesInCurrentCell = 0;
+                }
+                else
+                {
+                    // Still in same cell - increment duration
+                    framesInCurrentCell++;
+
+                    // Apply penalty if staying too long in same cell
+                    if (PENALIZE_IDLING && framesInCurrentCell > IDLE_THRESHOLD)
+                    {
+                        reward += IDLE_PENALTY_RATE;
                     }
                 }
 
                 // Small time penalty to encourage efficiency
                 reward += STEP_COST;
-
-                // Exit proximity reward is now only given on new cell discovery
-                // (see cell exploration section above)
-                // This prevents reward farming by camping near exits
-
-                // Optional: small distance-based reward for progress within a room
-                if (USE_DISTANCE_REWARD)
-                {
-                    float currentX = pl.X;
-                    float newProgress = Math.Max(currentX, maxXProgress);
-                    float progressDelta = newProgress - maxXProgress;
-                    maxXProgress = newProgress;
-                    reward += progressDelta * PROGRESS_SCALE;
-                }
             }
             else
             {
@@ -1184,7 +1095,6 @@ namespace RLBridge
                 catch (Exception e)
                 {
                     // Player state is invalid (probably during transition/removal)
-                    Logger.Log(LogLevel.Warn, "RLBridge", $"Failed to read player state: {e.Message}");
                 }
             }
 
@@ -1206,7 +1116,6 @@ namespace RLBridge
                 }
                 catch (Exception e)
                 {
-                    Logger.Log(LogLevel.Error, "RLBridge", $"Failed to capture frame: {e.Message}");
                 }
             }
 
@@ -1242,28 +1151,18 @@ namespace RLBridge
 
             // Calculate temporal progress signals (0-1 normalized)
             // Stagnation progress only counts after warmup period
-            float stagnationProgress = episodeSteps < STAGNATION_WARMUP_STEPS ? 0.0f :
-                Math.Min(stepsSinceLastNewCell / (float)STAGNATION_THRESHOLD, 1.0f);
+            // Distance-based stagnation progress (0-1)
+            float stagnationProgress = Math.Min(stepsSinceDistanceImproved / (float)STAGNATION_THRESHOLD, 1.0f);
             float episodeProgress = Math.Min(episodeSteps / (float)MAX_EPISODE_STEPS, 1.0f);
-
-            // Generate visited cell map for current room
-            List<byte> visitedMap = GenerateVisitedCellMap(lvl, currentRoom);
-
-            // Calculate grid dimensions for visited map
-            Rectangle roomBounds = lvl.Bounds;
-            int gridWidth = (int)Math.Ceiling(roomBounds.Width / (float)CELL_SIZE);
-            int gridHeight = (int)Math.Ceiling(roomBounds.Height / (float)CELL_SIZE);
 
             var obs = new {
                 px, py, vx, vy, onGround, dashes, stamina,
                 frame = frameBase64,
                 frameWidth,
                 frameHeight,
-                stagnationProgress,  // 0-1: How close to stagnation termination
+                stagnationProgress,  // 0-1: How close to stagnation termination (distance-based)
                 episodeProgress,     // 0-1: How far through episode
-                visitedMap,          // Flat array of bytes (0=unvisited, 255=visited)
-                visitedMapWidth = gridWidth,   // Grid width (in cells)
-                visitedMapHeight = gridHeight  // Grid height (in cells)
+                roomsVisitedCount = visitedRooms.Count  // Number of unique rooms visited this episode
             };
 
             var info = new {
@@ -1272,11 +1171,11 @@ namespace RLBridge
                 stagnated,
                 maxStepsReached,
                 episodeSteps,
-                stepsSinceLastNewCell,
+                stepsSinceDistanceImproved,
+                bestDistanceToExit,
                 room = currentRoom,
                 area = lvl.Session?.Area.GetSID() ?? "unknown",
                 roomsVisited = visitedRooms.Count,
-                cellsVisited = visitedCells.Count,
                 cellX,
                 cellY
             };
@@ -1317,8 +1216,6 @@ namespace RLBridge
             // NATIVE MODE: Return raw backbuffer RGB without interpolation
             if (Settings.ColorMode == FrameColorMode.Native)
             {
-                Logger.Log(LogLevel.Info, "RLBridge",
-                    $"Native mode: Capturing at {srcWidth}x{srcHeight} resolution");
 
                 width = srcWidth;
                 height = srcHeight;
@@ -1457,7 +1354,6 @@ namespace RLBridge
             }
             catch (Exception e)
             {
-                Logger.Log(LogLevel.Warn, "RLBridge", $"Failed to capture frame: {e.Message}");
                 return null;
             }
         }
@@ -1484,6 +1380,10 @@ namespace RLBridge
             // 14: Long Jump (held for 40 frames)
             // 15: Long Jump + Left (held for 40 frames)
             // 16: Long Jump + Right (held for 40 frames)
+            // 17: Down (crouch/duck)
+            // 18: Dash Down
+            // 19: Dash Down-Left
+            // 20: Dash Down-Right
 
             var a = new InputState();
 
@@ -1530,27 +1430,29 @@ namespace RLBridge
 
                 case 9: // Dash Left
                     a.Dash = true;
-                    a.Aim = new Vector2(-1, 0);
+                    a.MoveX = -1;
                     break;
 
                 case 10: // Dash Right
                     a.Dash = true;
-                    a.Aim = new Vector2(1, 0);
+                    a.MoveX = 1;
                     break;
 
                 case 11: // Dash Up
                     a.Dash = true;
-                    a.Aim = new Vector2(0, -1);
+                     a.MoveY = -1;
                     break;
 
                 case 12: // Dash Up-Left
                     a.Dash = true;
-                    a.Aim = new Vector2(-1, -1).SafeNormalize();
+                    a.MoveY = -1;
+                    a.MoveX = -1;
                     break;
 
                 case 13: // Dash Up-Right
                     a.Dash = true;
-                    a.Aim = new Vector2(1, -1).SafeNormalize();
+                    a.MoveY = -1;
+                    a.MoveX = 1;
                     break;
 
                 case 14: // Long Jump (held for 40 frames via action repeat)
@@ -1564,6 +1466,27 @@ namespace RLBridge
 
                 case 16: // Long Jump + Right (held for 40 frames via action repeat)
                     a.JumpTap = true;
+                    a.MoveX = 1;
+                    break;
+
+                case 17: // Down (crouch/duck)
+                    a.MoveY = 1;
+                    break;
+
+                case 18: // Dash Down
+                    a.Dash = true;
+                    a.MoveY = 1;
+                    break;
+
+                case 19: // Dash Down-Left
+                    a.Dash = true;
+                    a.MoveY = 1;
+                    a.MoveX = -1;
+                    break;
+
+                case 20: // Dash Down-Right
+                    a.Dash = true;
+                    a.MoveY = 1;
                     a.MoveX = 1;
                     break;
 
@@ -1683,7 +1606,6 @@ namespace RLBridge
             }
             catch (Exception e)
             {
-                Logger.Log(LogLevel.Error, "RLBridge", $"Failed to force button press: {e.Message}");
             }
         }
 
@@ -1714,7 +1636,6 @@ namespace RLBridge
             }
             catch (Exception e)
             {
-                Logger.Log(LogLevel.Error, "RLBridge", $"Failed to force button hold: {e.Message}");
             }
         }
 
@@ -1740,7 +1661,6 @@ namespace RLBridge
             }
             catch (Exception e)
             {
-                Logger.Log(LogLevel.Error, "RLBridge", $"Failed to release button: {e.Message}");
             }
         }
 
