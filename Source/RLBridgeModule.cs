@@ -64,6 +64,7 @@ namespace RLBridge
         // Room-based progression tracking
         private HashSet<string> visitedRooms = new HashSet<string>();
         private string lastRoom = "";
+        private int maxRoomReached = 0;  // Highest room number reached this episode (for stagnation tracking)
 
         // Exit tracking (room adjacency from Level.Bounds)
         private Dictionary<string, List<Vector2>> roomExits = new Dictionary<string, List<Vector2>>();
@@ -83,6 +84,13 @@ namespace RLBridge
         // Death tracking (to apply penalty only once)
         private bool hasDied = false;
         private bool hasStagnated = false;
+
+        // Action discontinuity tracking (frames without queued action)
+        private int lastAppliedActionId = -1;           // Last action that was applied (-1 = none)
+        private int currentIdleStreak = 0;              // Current consecutive frames without action
+        private int maxIdleStreak = 0;                  // Longest idle streak this episode
+        private int totalIdleFrames = 0;                // Total frames without action this episode
+        private int idleFramesThisStep = 0;             // Idle frames since last step command
 
         // Transition error handling (for high-speed race conditions)
         private int consecutiveTransitionErrors = 0;
@@ -109,8 +117,8 @@ namespace RLBridge
         private const bool TERMINATE_ON_MAX_STEPS = true;   // Enable max steps termination
 
         // Room rewards
-        private const float NEW_ROOM_REWARD = 2.0f;        // Reward for discovering new room
-        private const float REVISIT_ROOM_PENALTY = -.50f;  // Penalty for backtracking to visited room (heavy to prevent bouncing)
+        private const float NEW_ROOM_REWARD = 0.0f;        // Reward for discovering new room
+        private const float REVISIT_ROOM_PENALTY = 0.0f;  // Penalty for backtracking to visited room (heavy to prevent bouncing)
 
         // Penalties
         private const float DEATH_PENALTY = -.50f;         // One-time penalty on death
@@ -128,7 +136,7 @@ namespace RLBridge
         // This gives higher rewards near the exit (steeper gradient)
         // For 300px room: total cumulative reward ≈ sqrt(300) * PROGRESS_SCALE ≈ 3.5
         private const bool USE_DISTANCE_REWARD = true;     // Enable exit proximity reward
-        private const float PROGRESS_SCALE = 0.2f;         // Scale for sqrt-shaped distance reward
+        private const float PROGRESS_SCALE = 1.0f;         // Scale for sqrt-shaped distance reward
 
         // ======== END CONFIGURATION ========
 
@@ -404,6 +412,7 @@ namespace RLBridge
                         ScanForExits(self, currentRoomName);
                     }
                     lastRoom = currentRoomName;
+                    maxRoomReached = GetRoomNumber(currentRoomName);  // Initialize max room to starting room
 
                     // Reset cell tracking and initialize distance for potential-based reward
                     var pl = self.Tracker?.GetEntity<Player>();
@@ -419,7 +428,7 @@ namespace RLBridge
                         lastCellDistanceToExit = GetDistanceFromPointToNearestExit(self, cellCenter, currentRoomName);
 
                         // Set lastCellKey to spawn cell so first step doesn't trigger spurious cell change
-                        lastCellKey = $"{currentRoomName}:{startCellX},{startCellX}";
+                        lastCellKey = $"{currentRoomName}:{startCellX},{startCellY}";
                     }
                     else
                     {
@@ -436,6 +445,13 @@ namespace RLBridge
                     hasDied = false;
                     hasStagnated = false;
                     consecutiveTransitionErrors = 0;
+
+                    // Reset action discontinuity tracking
+                    lastAppliedActionId = -1;
+                    currentIdleStreak = 0;
+                    maxIdleStreak = 0;
+                    totalIdleFrames = 0;
+                    idleFramesThisStep = 0;
                     framesWaitingForStability = 0;
                     setSpawnPoint = false;
                     lastExitScanRoom = "";
@@ -456,6 +472,9 @@ namespace RLBridge
                     ApplyInput(stagedInput);
                     framesToRun--;
                     framesWaitingForStability = 0;
+
+                    // Track action discontinuity: reset idle streak when we apply an action
+                    currentIdleStreak = 0;
                 }
                 else if (framesToRun > 0 && !(isStable || isControllable))
                 {
@@ -467,6 +486,16 @@ namespace RLBridge
                         framesToRun = 0;
                         framesWaitingForStability = 0;
                     }
+                }
+                else if (framesToRun == 0 && responseSent && isStable && isControllable)
+                {
+                    // Track action discontinuity: game is running but no action queued
+                    // This happens when Python hasn't sent the next step command yet
+                    currentIdleStreak++;
+                    totalIdleFrames++;
+                    idleFramesThisStep++;
+                    if (currentIdleStreak > maxIdleStreak)
+                        maxIdleStreak = currentIdleStreak;
                 }
 
                 // Run the game update (this advances by one frame; TAS can "gate" deterministically)
@@ -590,7 +619,7 @@ namespace RLBridge
                 // Only sleep if we're not processing steps, not resetting, and response is sent
                 if (responseSent && framesToRun == 0 && !pendingReset)
                 {
-                    Thread.Sleep(1);  // 1ms sleep to yield CPU
+                    //Thread.Sleep(4);  // 1ms sleep to yield CPU
                 }
             }
             catch (Exception e)
@@ -621,7 +650,13 @@ namespace RLBridge
                             roomsVisited = 0,
                             cellsVisited = 0,
                             cellX = 0,
-                            cellY = 0
+                            cellY = 0,
+                            // Action discontinuity tracking (default values for error)
+                            lastActionId = -1,
+                            idleFramesThisStep = 0,
+                            currentIdleStreak = 0,
+                            maxIdleStreak = 0,
+                            totalIdleFrames = 0
                         };
                         server.TrySend(new { obs = errorObs, reward = 0f, done = true, info = errorInfo });
                         responseSent = true;
@@ -781,6 +816,9 @@ namespace RLBridge
                         stagedInput = DecodeAction(action);
                         framesToRun = Math.Max(1, repeat);
                         responseSent = false;
+                        // Track action for discontinuity analysis
+                        lastAppliedActionId = action;
+                        idleFramesThisStep = 0;  // Reset per-step idle counter
                         break;
 
                     case "set_render":
@@ -802,6 +840,21 @@ namespace RLBridge
 
         // ======== Reward calculation (per frame) ========
 
+        // Helper to extract room number from room name (e.g., "lvl_00" -> 0, "a-03" -> 3, "12" -> 12)
+        // Returns -1 if no number found
+        private int GetRoomNumber(string roomName)
+        {
+            if (string.IsNullOrEmpty(roomName))
+                return -1;
+
+            // Extract all digits from the room name and parse as integer
+            string digits = new string(roomName.Where(char.IsDigit).ToArray());
+            if (string.IsNullOrEmpty(digits))
+                return -1;
+
+            return int.TryParse(digits, out int num) ? num : -1;
+        }
+
         private void ScanForExits(Level lvl, string roomName)
         {
             if (string.IsNullOrEmpty(roomName) || roomName == lastExitScanRoom)
@@ -813,6 +866,9 @@ namespace RLBridge
             // Get current room bounds
             Rectangle currentBounds = lvl.Bounds;
 
+            // Get current room number for forward-only filtering
+            int currentRoomNum = GetRoomNumber(roomName);
+
             // Check all rooms in the map for adjacency
             if (lvl.Session?.MapData?.Levels != null)
             {
@@ -821,6 +877,12 @@ namespace RLBridge
                     // Skip the current room
                     if (room.Name == roomName)
                         continue;
+
+                    // Only include exits to forward rooms (higher room number)
+                    // This prevents the agent from being rewarded for going backwards
+                    int otherRoomNum = GetRoomNumber(room.Name);
+                    if (otherRoomNum <= currentRoomNum)
+                        continue;  // Skip backwards/same room
 
                     Rectangle otherBounds = room.Bounds;
 
@@ -989,11 +1051,19 @@ namespace RLBridge
                         entryExitPoint = nearestExit;
                     }
 
+                    int currentRoomNum = GetRoomNumber(currentRoom);
+
                     if (!visitedRooms.Contains(currentRoom))
                     {
-                        // New room discovered!
+                        // New room - but only reward if it's a forward room (higher room number)
                         visitedRooms.Add(currentRoom);
-                        reward += NEW_ROOM_REWARD;
+                        if (currentRoomNum > maxRoomReached)
+                        {
+                            // Forward progress - new room with higher number than ever reached
+                            reward += NEW_ROOM_REWARD;
+                            maxRoomReached = currentRoomNum;
+                        }
+                        // If room number is lower or same as max, no reward (but still mark as visited)
                     }
                     else
                     {
@@ -1009,6 +1079,11 @@ namespace RLBridge
                 }
 
                 // Cell change tracking and distance-based rewards
+                // Only give rewards/reset stagnation if we're in the max room or beyond
+                // This prevents getting credit for moving around in earlier rooms after backtracking
+                int cellRoomNum = GetRoomNumber(currentRoom);
+                bool isAtFrontier = cellRoomNum >= maxRoomReached;
+
                 if (cellKey != lastCellKey)
                 {
                     // Changed cells - calculate distance reward
@@ -1022,20 +1097,25 @@ namespace RLBridge
                         if (currentCellDistance > 0 && currentCellDistance < float.MaxValue &&
                             lastCellDistanceToExit < float.MaxValue)
                         {
-                            // Sqrt potential-based reward: φ(d) = -sqrt(d)
-                            // reward = sqrt(d_old) - sqrt(d_new)
-                            // Gives ~4x higher reward near exit vs far away
-                            float oldPotential = (float)Math.Sqrt(lastCellDistanceToExit);
-                            float newPotential = (float)Math.Sqrt(currentCellDistance);
-                            float shapedReward = (oldPotential - newPotential) * PROGRESS_SCALE;
-                            reward += shapedReward;
-
-                            // Distance-based stagnation: reset counter if we improved best distance
-                            if (currentCellDistance < bestDistanceToExit)
+                            // Only give distance rewards if at the frontier (max room reached)
+                            if (isAtFrontier)
                             {
-                                bestDistanceToExit = currentCellDistance;
-                                stepsSinceDistanceImproved = 0;
+                                // Sqrt potential-based reward: φ(d) = -sqrt(d)
+                                // reward = sqrt(d_old) - sqrt(d_new)
+                                // Gives ~4x higher reward near exit vs far away
+                                float oldPotential = (float)Math.Sqrt(lastCellDistanceToExit);
+                                float newPotential = (float)Math.Sqrt(currentCellDistance);
+                                float shapedReward = (oldPotential - newPotential) * PROGRESS_SCALE;
+                                reward += shapedReward;
+
+                                // Distance-based stagnation: reset counter if we improved best distance
+                                if (currentCellDistance < bestDistanceToExit)
+                                {
+                                    bestDistanceToExit = currentCellDistance;
+                                    stepsSinceDistanceImproved = 0;
+                                }
                             }
+                            // If not at frontier, no reward and stagnation counter keeps ticking
                         }
 
                         // Update for next cell change
@@ -1177,7 +1257,13 @@ namespace RLBridge
                 area = lvl.Session?.Area.GetSID() ?? "unknown",
                 roomsVisited = visitedRooms.Count,
                 cellX,
-                cellY
+                cellY,
+                // Action discontinuity tracking (frames without queued action)
+                lastActionId = lastAppliedActionId,          // Last action applied (-1 if none)
+                idleFramesThisStep,                          // Frames without action since last step
+                currentIdleStreak,                           // Current consecutive idle frames
+                maxIdleStreak,                               // Longest idle streak this episode
+                totalIdleFrames                              // Total idle frames this episode
             };
 
             return (obs, done, info);
@@ -1362,7 +1448,8 @@ namespace RLBridge
 
         private InputState DecodeAction(int id)
         {
-            // Action space (17 actions):
+            // Action space (18 actions, frame-by-frame control):
+            // Long jumps removed - model holds jump by selecting jump repeatedly
             // 0: Idle
             // 1: Left
             // 2: Right
@@ -1377,13 +1464,10 @@ namespace RLBridge
             // 11: Dash Up
             // 12: Dash Up-Left
             // 13: Dash Up-Right
-            // 14: Long Jump (held for 40 frames)
-            // 15: Long Jump + Left (held for 40 frames)
-            // 16: Long Jump + Right (held for 40 frames)
-            // 17: Down (crouch/duck)
-            // 18: Dash Down
-            // 19: Dash Down-Left
-            // 20: Dash Down-Right
+            // 14: Down (crouch/duck)
+            // 15: Dash Down
+            // 16: Dash Down-Left
+            // 17: Dash Down-Right
 
             var a = new InputState();
 
@@ -1440,7 +1524,7 @@ namespace RLBridge
 
                 case 11: // Dash Up
                     a.Dash = true;
-                     a.MoveY = -1;
+                    a.MoveY = -1;
                     break;
 
                 case 12: // Dash Up-Left
@@ -1455,36 +1539,22 @@ namespace RLBridge
                     a.MoveX = 1;
                     break;
 
-                case 14: // Long Jump (held for 40 frames via action repeat)
-                    a.JumpTap = true;
-                    break;
-
-                case 15: // Long Jump + Left (held for 40 frames via action repeat)
-                    a.JumpTap = true;
-                    a.MoveX = -1;
-                    break;
-
-                case 16: // Long Jump + Right (held for 40 frames via action repeat)
-                    a.JumpTap = true;
-                    a.MoveX = 1;
-                    break;
-
-                case 17: // Down (crouch/duck)
+                case 14: // Down (crouch/duck)
                     a.MoveY = 1;
                     break;
 
-                case 18: // Dash Down
+                case 15: // Dash Down
                     a.Dash = true;
                     a.MoveY = 1;
                     break;
 
-                case 19: // Dash Down-Left
+                case 16: // Dash Down-Left
                     a.Dash = true;
                     a.MoveY = 1;
                     a.MoveX = -1;
                     break;
 
-                case 20: // Dash Down-Right
+                case 17: // Dash Down-Right
                     a.Dash = true;
                     a.MoveY = 1;
                     a.MoveX = 1;
